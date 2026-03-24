@@ -54,6 +54,37 @@ class EvidenceItem:
             metadata=dict(payload.get("metadata") or {}),
         )
 
+@dataclass(slots=True)
+class DocumentFingerprint:
+    sha256: str
+    file_size_bytes: int
+    parser: str
+    pdf_header: str | None = None
+    trailer_id: list[str] = field(default_factory=list)
+    info_keys: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class IngestDiagnostics:
+    parser: str
+    page_count: int
+    is_encrypted: bool
+    has_acroform: bool
+    has_native_text: bool
+    native_text_pages: list[int]
+    fingerprint: DocumentFingerprint
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DocumentPackage:
+    document_id: str
+    file_hash: str
+    page_count: int
+    pdf_type: PdfType
+    has_native_text: bool
+    has_form_fields: bool
+    diagnostics: IngestDiagnostics
 
 @dataclass(frozen=True)
 class ValidationIssue:

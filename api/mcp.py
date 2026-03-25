@@ -279,7 +279,7 @@ class _App:
             await receive()
             await send({"type": "lifespan.shutdown.complete"})
             return
-        mgr = StreamableHTTPSessionManager(app=server, stateless=True)
+        mgr = StreamableHTTPSessionManager(app=server, stateless=True, json_response=True)
         async with mgr.run():
             await mgr.handle_request(scope, receive, send)
 

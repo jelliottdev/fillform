@@ -1,6 +1,14 @@
-"""Entry point: python -m fillform.mcp  or  python -m fillform"""
+"""Entry point: python -m fillform.mcp  or  python -m fillform
 
-import asyncio
-from .mcp import main
+stdio (default):
+    python -m fillform.mcp
 
-asyncio.run(main())
+HTTP/SSE (URL mode):
+    python -m fillform.mcp --http
+    python -m fillform.mcp --http --port 9000
+    python -m fillform.mcp --http --host 0.0.0.0 --port 8000
+"""
+
+from .mcp import _cli
+
+_cli()

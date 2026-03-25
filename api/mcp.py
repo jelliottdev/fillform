@@ -64,16 +64,27 @@ async def list_tools() -> list[Tool]:
                 "Extract AcroForm fields from a PDF, assign sequential FXXX aliases "
                 "(F001, F002, …), overlay those labels in vibrant orange, and return "
                 "the alias key-mapping JSON plus JPEG images of the annotated pages. "
-                "Accepts the PDF as a base64-encoded string. To avoid context overflow "
-                "on long PDFs, use page_start/page_end to request pages in small batches "
-                "(e.g. pages 1-3, then 4-6). After viewing all pages call save_field_mapping."
+                "IMPORTANT: prefer file_path over pdf_base64 — passing a file path "
+                "avoids base64-encoding the file in the conversation (which causes "
+                "context overflow). Only fall back to pdf_base64 if the file is not "
+                "accessible by path. To avoid context overflow on long PDFs, use "
+                "page_start/page_end to request pages in small batches."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to the PDF file on the server's filesystem. "
+                            "Use this instead of pdf_base64 whenever possible — it avoids "
+                            "printing the file contents into the conversation. "
+                            "Example: /mnt/user-data/uploads/form.pdf"
+                        ),
+                    },
                     "pdf_base64": {
                         "type": "string",
-                        "description": "Base64-encoded PDF file content.",
+                        "description": "Base64-encoded PDF file content. Only use if file_path is not available.",
                     },
                     "page_start": {
                         "type": "integer",
@@ -143,23 +154,42 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
 
 async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    pdf_b64 = args.get("pdf_base64") or ""
     dpi = int(args.get("dpi") or 72)
     page_start = max(1, int(args.get("page_start") or 1))
     page_end_arg = args.get("page_end")
 
-    if not pdf_b64:
-        return [TextContent(type="text", text="ERROR: pdf_base64 is required.")]
+    file_path = args.get("file_path") or ""
+    pdf_b64 = args.get("pdf_base64") or ""
 
-    try:
-        pdf_bytes = base64.b64decode(pdf_b64)
-    except Exception as exc:
-        return [TextContent(type="text", text=f"ERROR decoding pdf_base64: {exc}")]
+    if not file_path and not pdf_b64:
+        return [TextContent(type="text", text="ERROR: provide file_path or pdf_base64.")]
 
-    # Write PDF to /tmp for processing
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir="/tmp") as f:
-        f.write(pdf_bytes)
-        pdf_tmp = Path(f.name)
+    # Resolve PDF bytes from either source
+    if file_path:
+        fp = Path(file_path).expanduser()
+        if not fp.exists():
+            return [TextContent(
+                type="text",
+                text=(
+                    f"ERROR: file not found at '{file_path}'.\n"
+                    "If you are on claude.ai, uploaded files are at "
+                    "/mnt/user-data/uploads/<filename>. Make sure you pass the "
+                    "exact path shown when the file was uploaded."
+                ),
+            )]
+        pdf_bytes = fp.read_bytes()
+        # Use the original file directly — no temp copy needed
+        pdf_tmp = fp
+        _own_tmp = False
+    else:
+        try:
+            pdf_bytes = base64.b64decode(pdf_b64)
+        except Exception as exc:
+            return [TextContent(type="text", text=f"ERROR decoding pdf_base64: {exc}")]
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir="/tmp") as f:
+            f.write(pdf_bytes)
+            pdf_tmp = Path(f.name)
+        _own_tmp = True
 
     annotated_tmp = Path(tempfile.mktemp(suffix="_annotated.pdf", dir="/tmp"))
 
@@ -182,7 +212,8 @@ async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent
     except Exception as exc:
         return [TextContent(type="text", text=f"ERROR during annotation/rendering: {exc}")]
     finally:
-        pdf_tmp.unlink(missing_ok=True)
+        if _own_tmp:
+            pdf_tmp.unlink(missing_ok=True)
         annotated_tmp.unlink(missing_ok=True)
 
     total_pages = len(all_page_images)

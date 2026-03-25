@@ -101,7 +101,7 @@ async def list_tools() -> list[Tool]:
                         "default": 72,
                     },
                 },
-                "required": ["pdf_base64"],
+                "required": [],
             },
         ),
         Tool(

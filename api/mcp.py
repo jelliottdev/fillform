@@ -14,7 +14,7 @@ Claude Code URL config::
     {
       "mcpServers": {
         "fillform": {
-          "url": "https://<your-project>.vercel.app/mcp"
+          "url": "https://<your-project>.vercel.app"
         }
       }
     }
@@ -287,6 +287,9 @@ async def _handle_mcp(scope, receive, send) -> None:
 
 
 app = Starlette(
-    routes=[Route("/mcp", endpoint=_handle_mcp, methods=["GET", "POST", "DELETE"])],
+    routes=[
+        # MCP handler at root — Claude Code sends all MCP traffic to the base URL
+        Route("/", endpoint=_handle_mcp, methods=["GET", "POST", "DELETE"]),
+    ],
     lifespan=_lifespan,
 )

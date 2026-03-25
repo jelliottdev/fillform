@@ -19,18 +19,32 @@ save_field_mapping
 
 Usage
 -----
-Run the server over stdio (the default Claude Code MCP transport):
+**stdio** (local process, Claude Code default)::
 
     python -m fillform.mcp
 
-Or add it to ``~/.claude/settings.json``:
-
+    # ~/.claude/settings.json
     {
       "mcpServers": {
         "fillform": {
           "command": "python",
           "args": ["-m", "fillform.mcp"],
           "cwd": "/path/to/fillform/src"
+        }
+      }
+    }
+
+**HTTP / SSE** (URL-based, works with remote Claude Code or any MCP client)::
+
+    python -m fillform.mcp --http              # listens on http://localhost:8000/sse
+    python -m fillform.mcp --http --port 9000  # custom port
+    python -m fillform.mcp --http --host 0.0.0.0 --port 8000  # public
+
+    # ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "fillform": {
+          "url": "http://localhost:8000/sse"
         }
       }
     }
@@ -45,6 +59,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from mcp.server import Server
+from mcp.server.sse import SseServerTransport
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     CallToolResult,
@@ -344,10 +359,11 @@ def _render_pages(pdf_path: Path, dpi: int = 150) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry points — stdio and HTTP/SSE
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    """Run over stdio (default for local Claude Code MCP config)."""
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -356,6 +372,59 @@ async def main() -> None:
         )
 
 
-if __name__ == "__main__":
+async def main_http(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Run over HTTP with SSE transport.
+
+    Claude Code connects via:  ``{ "url": "http://<host>:<port>/sse" }``
+    """
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.routing import Mount, Route
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request: Request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send
+        ) as streams:
+            await server.run(
+                streams[0],
+                streams[1],
+                server.create_initialization_options(),
+            )
+
+    app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ]
+    )
+
+    print(f"fillform MCP server listening on http://{host}:{port}/sse")
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
+def _cli() -> None:
+    """CLI entry point: parses --http / --host / --port flags."""
+    import argparse
     import asyncio
-    asyncio.run(main())
+
+    parser = argparse.ArgumentParser(description="fillform MCP server")
+    parser.add_argument(
+        "--http", action="store_true",
+        help="Run HTTP/SSE server instead of stdio",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host (HTTP mode, default 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Bind port (HTTP mode, default 8000)")
+    args = parser.parse_args()
+
+    if args.http:
+        asyncio.run(main_http(host=args.host, port=args.port))
+    else:
+        asyncio.run(main())
+
+
+if __name__ == "__main__":
+    _cli()

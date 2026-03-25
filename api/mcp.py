@@ -38,10 +38,6 @@ sys.path.insert(0, str(_HERE.parent / "src"))
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import ImageContent, TextContent, Tool
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.routing import Route
 
 from fillform.annotator import PdfAnnotator
 from fillform.contracts import CanonicalField, CanonicalSchema
@@ -269,20 +265,23 @@ def _render_pages(pdf_path: Path, dpi: int = 150) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Starlette ASGI app  (Vercel detects the `app` variable)
+# ASGI app  (Vercel detects the `app` variable)
 # ---------------------------------------------------------------------------
-# Each request gets a fresh StreamableHTTPSessionManager so there is no
-# shared state — safe for Vercel's serverless model where the ASGI lifespan
-# may fire per-invocation rather than once at process startup.
+# Plain ASGI callable — no Starlette routing needed.
+# Each request creates a fresh StreamableHTTPSessionManager so there is
+# no shared state across invocations (required for Vercel serverless).
 
-async def _handle_mcp(scope, receive, send) -> None:
-    mgr = StreamableHTTPSessionManager(app=server, stateless=True)
-    async with mgr.run():
-        await mgr.handle_request(scope, receive, send)
+class _App:
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        mgr = StreamableHTTPSessionManager(app=server, stateless=True)
+        async with mgr.run():
+            await mgr.handle_request(scope, receive, send)
 
 
-app = Starlette(
-    routes=[
-        Route("/", endpoint=_handle_mcp, methods=["GET", "POST", "DELETE"]),
-    ],
-)
+app = _App()

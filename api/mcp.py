@@ -23,7 +23,6 @@ Claude Code URL config::
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
 import sys
@@ -272,24 +271,18 @@ def _render_pages(pdf_path: Path, dpi: int = 150) -> list[str]:
 # ---------------------------------------------------------------------------
 # Starlette ASGI app  (Vercel detects the `app` variable)
 # ---------------------------------------------------------------------------
-
-session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app: Starlette):
-    async with session_manager.run():
-        yield
-
+# Each request gets a fresh StreamableHTTPSessionManager so there is no
+# shared state — safe for Vercel's serverless model where the ASGI lifespan
+# may fire per-invocation rather than once at process startup.
 
 async def _handle_mcp(scope, receive, send) -> None:
-    await session_manager.handle_request(scope, receive, send)
+    mgr = StreamableHTTPSessionManager(app=server, stateless=True)
+    async with mgr.run():
+        await mgr.handle_request(scope, receive, send)
 
 
 app = Starlette(
     routes=[
-        # MCP handler at root — Claude Code sends all MCP traffic to the base URL
         Route("/", endpoint=_handle_mcp, methods=["GET", "POST", "DELETE"]),
     ],
-    lifespan=_lifespan,
 )

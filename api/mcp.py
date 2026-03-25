@@ -63,9 +63,10 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Extract AcroForm fields from a PDF, assign sequential FXXX aliases "
                 "(F001, F002, …), overlay those labels in vibrant orange, and return "
-                "the alias key-mapping JSON plus a rendered PNG image of each annotated "
-                "page. Accepts the PDF as a base64-encoded string. Use the images to "
-                "identify what each labeled field collects, then call save_field_mapping."
+                "the alias key-mapping JSON plus JPEG images of the annotated pages. "
+                "Accepts the PDF as a base64-encoded string. To avoid context overflow "
+                "on long PDFs, use page_start/page_end to request pages in small batches "
+                "(e.g. pages 1-3, then 4-6). After viewing all pages call save_field_mapping."
             ),
             inputSchema={
                 "type": "object",
@@ -74,10 +75,19 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Base64-encoded PDF file content.",
                     },
+                    "page_start": {
+                        "type": "integer",
+                        "description": "1-based first page to return (default 1).",
+                        "default": 1,
+                    },
+                    "page_end": {
+                        "type": "integer",
+                        "description": "1-based last page to return inclusive (default: all pages, max 5 at a time).",
+                    },
                     "dpi": {
                         "type": "integer",
-                        "description": "Rendering resolution for page images (default 150).",
-                        "default": 150,
+                        "description": "Rendering resolution (default 72). Increase only if labels are unreadable.",
+                        "default": 72,
                     },
                 },
                 "required": ["pdf_base64"],
@@ -134,7 +144,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
 async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
     pdf_b64 = args.get("pdf_base64") or ""
-    dpi = int(args.get("dpi") or 150)
+    dpi = int(args.get("dpi") or 72)
+    page_start = max(1, int(args.get("page_start") or 1))
+    page_end_arg = args.get("page_end")
 
     if not pdf_b64:
         return [TextContent(type="text", text="ERROR: pdf_base64 is required.")]
@@ -166,32 +178,42 @@ async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent
 
     try:
         _annotator.annotate(pdf_tmp, alias_map, annotated_tmp)
-        page_images = _render_pages(annotated_tmp, dpi=dpi)
+        all_page_images = _render_pages(annotated_tmp, dpi=dpi)
     except Exception as exc:
         return [TextContent(type="text", text=f"ERROR during annotation/rendering: {exc}")]
     finally:
         pdf_tmp.unlink(missing_ok=True)
         annotated_tmp.unlink(missing_ok=True)
 
+    total_pages = len(all_page_images)
+    # Clamp page range; default page_end caps at 5 pages per call to avoid context overflow
+    _page_end = int(page_end_arg) if page_end_arg is not None else min(page_start + 4, total_pages)
+    _page_end = min(_page_end, total_pages)
+    page_start = min(page_start, total_pages)
+    selected = all_page_images[page_start - 1 : _page_end]
+
     alias_map_dict = alias_map.to_dict()
     field_count = len(alias_map.alias_to_field)
-    page_count = len(page_images)
 
+    more_pages = _page_end < total_pages
     content: list[TextContent | ImageContent] = [
         TextContent(
             type="text",
             text=(
-                f"Form analysis ready. Fields: {field_count}, Pages: {page_count}.\n\n"
-                f"Each orange label (F001, F002, …) marks an AcroForm field. "
-                f"Identify what each field collects, then call save_field_mapping.\n\n"
+                f"Form analysis ready. Fields: {field_count}, Total pages: {total_pages}. "
+                f"Showing pages {page_start}–{_page_end}."
+                + (f" Call again with page_start={_page_end + 1} for the remaining pages." if more_pages else "")
+                + "\n\nEach orange label (F001, F002, …) marks an AcroForm field. "
+                "Identify what each field collects, then call save_field_mapping.\n\n"
                 f"alias_map:\n{json.dumps(alias_map_dict, indent=2)}"
             ),
         ),
     ]
 
-    for page_index, image_b64 in enumerate(page_images):
-        content.append(TextContent(type="text", text=f"--- Page {page_index + 1} of {page_count} ---"))
-        content.append(ImageContent(type="image", data=image_b64, mimeType="image/png"))
+    for i, image_b64 in enumerate(selected):
+        pg = page_start + i
+        content.append(TextContent(type="text", text=f"--- Page {pg} of {total_pages} ---"))
+        content.append(ImageContent(type="image", data=image_b64, mimeType="image/jpeg"))
 
     return content
 
@@ -253,14 +275,14 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 # Page rendering helper
 # ---------------------------------------------------------------------------
 
-def _render_pages(pdf_path: Path, dpi: int = 150) -> list[str]:
+def _render_pages(pdf_path: Path, dpi: int = 72) -> list[str]:
     import fitz
     images: list[str] = []
     mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     with fitz.open(str(pdf_path)) as doc:
         for i in range(doc.page_count):
             pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
-            images.append(base64.standard_b64encode(pix.tobytes("png")).decode())
+            images.append(base64.standard_b64encode(pix.tobytes("jpg", jpg_quality=80)).decode())
     return images
 
 

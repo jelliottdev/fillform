@@ -21,6 +21,7 @@ from .ingest import (
     UnsupportedPdfError,
 )
 from .mapper import SemanticMapper
+from .mcp import server as fillform_mcp_server
 from .mcp_server import FillFormService
 from .schema_registry import SchemaRegistry
 from .verify import VerificationEngine
@@ -51,6 +52,8 @@ __all__ = [
     "FillFormService",
     "SchemaRegistry",
     "VerificationEngine",
+    # MCP server (token-free, Claude-native analysis)
+    "fillform_mcp_server",
     # Errors
     "UnsupportedPdfError",
     "EncryptedPdfError",

@@ -1,14 +1,18 @@
 """FillForm architecture skeleton package."""
 
+from .annotator import PdfAnnotator
 from .contracts import (
+    ArtifactRef,
     CanonicalField,
     CanonicalSchema,
     DocumentFingerprint,
     DocumentPackage,
     FillPayload,
     IngestDiagnostics,
+    PdfType,
     VerificationReport,
 )
+from .field_alias import AliasMap, FieldAliasRegistry
 from .fill_engine import FillEngine
 from .ingest import (
     CorruptPdfError,
@@ -20,22 +24,35 @@ from .mapper import SemanticMapper
 from .mcp_server import FillFormService
 from .schema_registry import SchemaRegistry
 from .verify import VerificationEngine
+from .vision_mapper import VisionFieldMapper
 
 __all__ = [
+    # Contracts
+    "ArtifactRef",
     "CanonicalField",
     "CanonicalSchema",
     "DocumentFingerprint",
     "DocumentPackage",
     "FillPayload",
     "IngestDiagnostics",
+    "PdfType",
     "VerificationReport",
+    # Field alias mapping
+    "AliasMap",
+    "FieldAliasRegistry",
+    # PDF annotation
+    "PdfAnnotator",
+    # Vision analysis
+    "VisionFieldMapper",
+    # Core services
     "FillEngine",
     "IngestionService",
-    "UnsupportedPdfError",
-    "EncryptedPdfError",
-    "CorruptPdfError",
     "SemanticMapper",
     "FillFormService",
     "SchemaRegistry",
     "VerificationEngine",
+    # Errors
+    "UnsupportedPdfError",
+    "EncryptedPdfError",
+    "CorruptPdfError",
 ]

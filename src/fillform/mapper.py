@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from .contracts import CanonicalSchema, StructuralRepresentation
+from .contracts import CanonicalSchema
+from .structure import StructuralRepresentation
 
 
 class SemanticMapper:

@@ -8,7 +8,201 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
+
+# PDF classification: AcroForm interactive, native digital text, or scanned image.
+PdfType = Literal["acroform", "digital", "scanned"]
+
+
+@dataclass(frozen=True)
+class CanonicalField:
+    """Semantic description of a single form field, enriched by vision analysis."""
+
+    alias: str                          # FXXX sequential identifier (e.g. F001)
+    field_name: str                     # Raw PDF AcroForm field name
+    field_type: str                     # Tx / Btn / Ch / Sig / unknown
+    page: int                           # 0-based page index
+    bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1) in PDF units
+
+    label: str | None = None            # Human-readable label inferred from context
+    context: str | None = None          # What information the field collects
+    expected_value_type: str | None = None  # string | date | number | boolean | signature | selection
+    expected_format: str | None = None  # e.g. "MM/DD/YYYY", "XXX-XX-XXXX"
+    is_required: bool = False
+    section: str | None = None          # Form section / group name
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "alias": self.alias,
+            "field_name": self.field_name,
+            "field_type": self.field_type,
+            "page": self.page,
+            "bbox": list(self.bbox),
+            "label": self.label,
+            "context": self.context,
+            "expected_value_type": self.expected_value_type,
+            "expected_format": self.expected_format,
+            "is_required": self.is_required,
+            "section": self.section,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CanonicalField":
+        bbox_raw = payload["bbox"]
+        return cls(
+            alias=str(payload["alias"]),
+            field_name=str(payload["field_name"]),
+            field_type=str(payload["field_type"]),
+            page=int(payload["page"]),
+            bbox=(float(bbox_raw[0]), float(bbox_raw[1]), float(bbox_raw[2]), float(bbox_raw[3])),
+            label=payload.get("label"),
+            context=payload.get("context"),
+            expected_value_type=payload.get("expected_value_type"),
+            expected_format=payload.get("expected_format"),
+            is_required=bool(payload.get("is_required", False)),
+            section=payload.get("section"),
+        )
+
+
+@dataclass(frozen=True)
+class CanonicalSchema:
+    """Complete semantic mapping of all fields in a PDF form."""
+
+    form_family: str
+    version: str
+    mode: str                           # acroform | overlay | hybrid
+    fields: list[CanonicalField] = field(default_factory=list)
+
+    @property
+    def alias_map(self) -> dict[str, str]:
+        """Return {field_name: alias} lookup."""
+        return {f.field_name: f.alias for f in self.fields}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "form_family": self.form_family,
+            "version": self.version,
+            "mode": self.mode,
+            "fields": [f.to_dict() for f in self.fields],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CanonicalSchema":
+        return cls(
+            form_family=str(payload["form_family"]),
+            version=str(payload["version"]),
+            mode=str(payload["mode"]),
+            fields=[CanonicalField.from_dict(f) for f in payload.get("fields", [])],
+        )
+
+    def to_fill_script(self) -> str:
+        """Generate a plain-text fill guide that an AI agent can use to fill the form.
+
+        The returned document describes every field, what data to collect from the
+        user, and the expected format, giving an LLM everything it needs to
+        deterministically fill the form once it has gathered the required information.
+        """
+        lines: list[str] = [
+            f"# Form Fill Guide: {self.form_family} (version {self.version})",
+            f"## Mode: {self.mode}  |  Total fields: {len(self.fields)}",
+            "",
+            "---",
+            "",
+            "## Field Definitions",
+            "",
+        ]
+
+        for f in self.fields:
+            heading = f.label or f.field_name
+            lines.append(f"### {f.alias} — {heading}")
+            lines.append(f"- **PDF field name**: `{f.field_name}`")
+            lines.append(f"- **Field type**: {f.field_type}")
+            if f.section:
+                lines.append(f"- **Section**: {f.section}")
+            if f.context:
+                lines.append(f"- **Purpose**: {f.context}")
+            if f.expected_value_type:
+                lines.append(f"- **Expected value type**: {f.expected_value_type}")
+            if f.expected_format:
+                lines.append(f"- **Format**: `{f.expected_format}`")
+            lines.append(f"- **Required**: {'Yes' if f.is_required else 'No'}")
+            lines.append(f"- **Page**: {f.page + 1}")
+            lines.append("")
+
+        lines += [
+            "---",
+            "",
+            "## AI Filler Instructions",
+            "",
+            "To fill this form, collect the following information from the user,",
+            "then call the fill API with the alias → value mapping.",
+            "",
+            "### Required fields",
+            "",
+        ]
+
+        required = [f for f in self.fields if f.is_required]
+        optional = [f for f in self.fields if not f.is_required]
+
+        if required:
+            for f in required:
+                label = f.label or f.field_name
+                vtype = f.expected_value_type or "text"
+                fmt = f"  (format: `{f.expected_format}`)" if f.expected_format else ""
+                lines.append(f"- **{f.alias}** — {label}: {vtype}{fmt}")
+        else:
+            lines.append("*(none marked required)*")
+
+        lines += ["", "### Optional fields", ""]
+
+        if optional:
+            for f in optional:
+                label = f.label or f.field_name
+                vtype = f.expected_value_type or "text"
+                fmt = f"  (format: `{f.expected_format}`)" if f.expected_format else ""
+                lines.append(f"- **{f.alias}** — {label}: {vtype}{fmt}")
+        else:
+            lines.append("*(none)*")
+
+        lines += [
+            "",
+            "---",
+            "",
+            "## Alias → Field Name Key",
+            "",
+            "```json",
+        ]
+        mapping = {f.alias: f.field_name for f in self.fields}
+        import json
+        lines.append(json.dumps(mapping, indent=2))
+        lines += ["```", ""]
+
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class FillPayload:
+    """Data provided by the user to fill a specific form instance."""
+
+    schema_family: str
+    schema_version: str
+    # Values keyed by alias (F001) or raw field name — fill engine resolves both.
+    values: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_family": self.schema_family,
+            "schema_version": self.schema_version,
+            "values": dict(self.values),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "FillPayload":
+        return cls(
+            schema_family=str(payload["schema_family"]),
+            schema_version=str(payload["schema_version"]),
+            values=dict(payload.get("values") or {}),
+        )
 
 
 def _format_datetime(value: datetime | None) -> str | None:

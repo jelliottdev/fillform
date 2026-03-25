@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import tempfile
 from pathlib import Path
 from typing import Any, Sequence
@@ -62,7 +63,6 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.server.stdio import stdio_server
 from mcp.types import (
-    CallToolResult,
     ImageContent,
     TextContent,
     Tool,
@@ -71,7 +71,7 @@ from mcp.types import (
 from .annotator import PdfAnnotator
 from .contracts import CanonicalField, CanonicalSchema
 from .field_alias import AliasMap, FieldAliasRegistry
-from .structure import PdfStructureService
+from .structure import PdfStructureService, TextBlock
 
 # ---------------------------------------------------------------------------
 # Server singleton
@@ -102,13 +102,14 @@ _annotator = PdfAnnotator()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
-            name="prepare_form_for_analysis",
+            name="extract_form_fields",
             description=(
                 "Extract AcroForm fields from a PDF, assign sequential FXXX aliases "
-                "(F001, F002, …), overlay those labels on the PDF in vibrant orange, "
-                "and return the alias key-mapping JSON plus a rendered PNG image of "
-                "each annotated page. Use the images to identify what each labeled "
-                "field is asking for, then call save_field_mapping with your analysis."
+                "(F001, F002, …), and return a compact JSON object with the alias map "
+                "and per-field metadata (page, bbox, type, nearby text label). "
+                "The response is JSON-only by default — no images — keeping context usage minimal. "
+                "Set annotate_pages=true to also receive annotated page images when "
+                "nearby_text labels are insufficient to identify fields."
             ),
             inputSchema={
                 "type": "object",
@@ -117,10 +118,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Absolute or relative path to the PDF file.",
                     },
-                    "dpi": {
-                        "type": "integer",
-                        "description": "Rendering resolution for page images (default 150).",
-                        "default": 150,
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
                     },
                 },
                 "required": ["pdf_path"],
@@ -187,16 +188,16 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent]:
-    if name == "prepare_form_for_analysis":
-        return await _prepare_form(arguments)
+    if name == "extract_form_fields":
+        return await _extract_fields(arguments)
     if name == "save_field_mapping":
         return await _save_mapping(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageContent]:
     pdf_path = Path(args["pdf_path"]).expanduser().resolve()
-    dpi = int(args.get("dpi") or 150)
+    annotate_pages = bool(args.get("annotate_pages", False))
 
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
@@ -207,65 +208,77 @@ async def _prepare_form(args: dict[str, Any]) -> list[TextContent | ImageContent
         return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
 
     if not structure.field_widgets:
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    f"No AcroForm fields found in '{pdf_path.name}'. "
-                    "This pipeline requires a PDF with interactive AcroForm fields."
-                ),
-            )
-        ]
+        return [TextContent(type="text", text=(
+            f"No AcroForm fields found in '{pdf_path.name}'. "
+            "This pipeline requires a PDF with interactive AcroForm fields."
+        ))]
 
     alias_map = _alias_registry.assign(structure.field_widgets)
 
-    # Write annotated PDF to a temp file
-    tmp = tempfile.NamedTemporaryFile(suffix="_annotated.pdf", delete=False)
-    tmp.close()
-    annotated_path = Path(tmp.name)
+    # Build per-field metadata with nearby text labels
+    fields_data: list[dict[str, Any]] = []
+    for alias, widget in alias_map.field_widgets.items():
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        page_dim = next(
+            (pd for pd in structure.page_dimensions if pd.page == widget.page), None
+        )
+        position = _position_hint(widget.bbox, widget.page, page_dim)
+        fields_data.append({
+            "alias": alias,
+            "name": widget.name,
+            "type": widget.field_type,
+            "page": widget.page + 1,
+            "bbox": [round(v, 1) for v in widget.bbox],
+            "position": position,
+            "nearby_text": nearby,
+        })
 
-    try:
-        _annotator.annotate(pdf_path, alias_map, annotated_path)
-        page_images = _render_pages(annotated_path, dpi=dpi)
-    except Exception as exc:
-        return [TextContent(type="text", text=f"ERROR during annotation/rendering: {exc}")]
+    fields_data.sort(key=lambda f: f["alias"])
 
-    alias_map_dict = alias_map.to_dict()
-    field_count = len(alias_map.alias_to_field)
-    page_count = len(page_images)
-
-    # Build response: summary text + alias map + one image per page
-    content: list[TextContent | ImageContent] = [
-        TextContent(
-            type="text",
-            text=(
-                f"Form analysis ready for '{pdf_path.name}'.\n"
-                f"  Fields found : {field_count}\n"
-                f"  Pages        : {page_count}\n\n"
-                f"The annotated page image(s) follow. Each orange label (F001, F002, …) "
-                f"marks an AcroForm field. Identify what each labeled field is asking for, "
-                f"then call save_field_mapping with your analysis.\n\n"
-                f"alias_map:\n{json.dumps(alias_map_dict, indent=2)}"
-            ),
+    result: dict[str, Any] = {
+        "field_count": len(fields_data),
+        "page_count": len(structure.page_dimensions),
+        "alias_map": alias_map.alias_to_field,
+        "fields": fields_data,
+        "instructions": (
+            "Review the 'nearby_text' and 'position' for each field to identify what it collects. "
+            "Once all fields are identified, call save_field_mapping with your analysis."
         ),
+    }
+
+    content: list[TextContent | ImageContent] = [
+        TextContent(type="text", text=json.dumps(result, indent=2))
     ]
 
-    for page_index, image_b64 in enumerate(page_images):
-        content.append(
-            TextContent(type="text", text=f"--- Page {page_index + 1} of {page_count} ---")
-        )
-        content.append(
-            ImageContent(type="image", data=image_b64, mimeType="image/png")
-        )
+    if annotate_pages:
+        tmp = tempfile.NamedTemporaryFile(suffix="_annotated.pdf", delete=False)
+        tmp.close()
+        annotated_path = Path(tmp.name)
+        try:
+            _annotator.annotate(pdf_path, alias_map, annotated_path)
+            page_images = _render_pages(annotated_path)
+            total = len(page_images)
+            for i, img_b64 in enumerate(page_images):
+                content.append(TextContent(type="text", text=f"--- Page {i+1} of {total} ---"))
+                content.append(ImageContent(type="image", data=img_b64, mimeType="image/jpeg"))
+        except Exception as exc:
+            content.append(TextContent(type="text", text=f"WARNING: annotation failed: {exc}"))
+        finally:
+            annotated_path.unlink(missing_ok=True)
 
     return content
 
 
 async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
-    pdf_path = Path(args["pdf_path"]).expanduser().resolve()
+    pdf_path_str = args.get("pdf_path") or ""
     form_family = str(args.get("form_family") or "unknown")
     version = str(args.get("version") or "1")
-    output_dir = Path(args["output_dir"]).expanduser().resolve() if args.get("output_dir") else pdf_path.parent
+
+    if pdf_path_str:
+        pdf_path = Path(pdf_path_str).expanduser().resolve()
+        output_dir = Path(args["output_dir"]).expanduser().resolve() if args.get("output_dir") else pdf_path.parent
+    else:
+        output_dir = Path(args.get("output_dir") or "/tmp").expanduser().resolve()
 
     # Parse alias map
     try:
@@ -279,9 +292,11 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
     except json.JSONDecodeError as exc:
         return [TextContent(type="text", text=f"ERROR parsing field_analysis_json: {exc}")]
 
-    # Reconstruct AliasMap from the stored JSON (no widgets needed for schema building)
-    alias_index: dict[str, str] = alias_map_raw.get("alias_index") or {}
-    key_mapping: dict[str, str] = alias_map_raw.get("key_mapping") or {}
+    # Accept both flat {alias→name} and nested {alias_index: {alias→name}} formats
+    if "alias_index" in alias_map_raw:
+        alias_index: dict[str, str] = alias_map_raw["alias_index"]
+    else:
+        alias_index = {k: v for k, v in alias_map_raw.items() if isinstance(v, str)}
 
     # Build CanonicalFields
     fields: list[CanonicalField] = []
@@ -337,25 +352,68 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 # Page rendering helper
 # ---------------------------------------------------------------------------
 
-def _render_pages(pdf_path: Path, dpi: int = 150) -> list[str]:
-    """Render each page of *pdf_path* to a base64-encoded PNG string."""
+def _render_pages(pdf_path: Path, dpi: int = 96) -> list[str]:
+    """Render each page of *pdf_path* to a base64-encoded JPEG string."""
     try:
         import fitz
     except ImportError as exc:
         raise RuntimeError("PyMuPDF (fitz) is required. Install with: pip install pymupdf") from exc
 
     images: list[str] = []
-    scale = dpi / 72.0
-    mat = fitz.Matrix(scale, scale)
-
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     with fitz.open(str(pdf_path)) as doc:
         for page_index in range(doc.page_count):
-            page = doc.load_page(page_index)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            png_bytes = pix.tobytes("png")
-            images.append(base64.standard_b64encode(png_bytes).decode())
-
+            pix = doc.load_page(page_index).get_pixmap(matrix=mat, alpha=False)
+            images.append(base64.standard_b64encode(pix.tobytes("jpg", jpg_quality=80)).decode())
     return images
+
+
+def _find_nearby_text(
+    bbox: tuple[float, float, float, float],
+    page: int,
+    text_blocks: list[TextBlock],
+    max_dist: float = 60.0,
+) -> str:
+    fx0, fy0, fx1, fy1 = bbox
+    f_cx = (fx0 + fx1) / 2
+    f_cy = (fy0 + fy1) / 2
+    best_text = ""
+    best_score = float("inf")
+    for block in text_blocks:
+        if block.page != page:
+            continue
+        text = (block.text or "").strip()
+        if not text:
+            continue
+        bx0, by0, bx1, by1 = block.bbox
+        b_cx = (bx0 + bx1) / 2
+        b_cy = (by0 + by1) / 2
+        dist = math.hypot(f_cx - b_cx, f_cy - b_cy)
+        if dist > max_dist:
+            continue
+        vert_offset = abs(f_cy - b_cy)
+        left_bonus = 0.0 if bx1 <= fx0 + 5 else 20.0
+        score = dist + vert_offset * 0.5 + left_bonus
+        if score < best_score:
+            best_score = score
+            best_text = text
+    if len(best_text) > 120:
+        best_text = best_text[:120].rsplit(" ", 1)[0] + "…"
+    return best_text
+
+
+def _position_hint(
+    bbox: tuple[float, float, float, float],
+    page: int,
+    page_dim: Any,
+) -> str:
+    if page_dim is None:
+        return f"page {page + 1}"
+    cx = (bbox[0] + bbox[2]) / 2 / page_dim.width
+    cy = (bbox[1] + bbox[3]) / 2 / page_dim.height
+    horiz = "left" if cx < 0.4 else ("right" if cx > 0.6 else "center")
+    vert = "upper" if cy < 0.33 else ("lower" if cy > 0.66 else "middle")
+    return f"page {page + 1}, {vert}-{horiz}"
 
 
 # ---------------------------------------------------------------------------

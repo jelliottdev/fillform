@@ -279,6 +279,19 @@ class _App:
             await receive()
             await send({"type": "lifespan.shutdown.complete"})
             return
+        # Per MCP streamable-HTTP spec: respond 405 to GET so clients fall back
+        # to POST-only mode (required for serverless — no persistent SSE).
+        if scope.get("method") == "GET":
+            await send({
+                "type": "http.response.start",
+                "status": 405,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"allow", b"POST, DELETE"),
+                ],
+            })
+            await send({"type": "http.response.body", "body": b""})
+            return
         mgr = StreamableHTTPSessionManager(app=server, stateless=True, json_response=True)
         async with mgr.run():
             await mgr.handle_request(scope, receive, send)

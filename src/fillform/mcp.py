@@ -81,7 +81,7 @@ import json
 import math
 import re
 import tempfile
-import uuid
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -349,6 +349,29 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="fill_pdf_now",
+            description=(
+                "Plain-language alias for fill_pdf_form. Directly fill the PDF with provided values."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
+                    "values_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Alias/value or field-name/value mapping.",
+                    },
+                    "alias_map_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Optional alias map for FXXX keys.",
+                    },
+                    "session_id": {"type": "string"},
+                    "output_pdf_path": {"type": "string"},
+                },
+                "required": ["values_json"],
+            },
+        ),
+        Tool(
             name="complete_form",
             description=(
                 "One-call pipeline for analyze + fill + completion report. "
@@ -519,6 +542,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
     if name == "fill_pdf_form":
         return await _fill_pdf_form(arguments)
     if name == "fill_this_pdf":
+        return await _fill_pdf_form(arguments)
+    if name == "fill_pdf_now":
         return await _fill_pdf_form(arguments)
     if name == "complete_form":
         return await _complete_form(arguments)
@@ -898,6 +923,7 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    t0 = time.monotonic()
     session = get_session(args.get("session_id"))
     try:
         pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
@@ -934,16 +960,19 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
             return [TextContent(type="text", text=f"ERROR: {exc}")]
 
     generated_demo_values: dict[str, str] = {}
+    analyze_ms_start = time.monotonic()
     if mode == "demo":
         generated_demo_values = _build_demo_values(
             alias_map=alias_map,
             structure=structure,
             provided_values=provided_values,
         )
+    analyze_ms = int((time.monotonic() - analyze_ms_start) * 1000)
 
     fill_values = dict(generated_demo_values)
     fill_values.update(provided_values)
 
+    fill_ms_start = time.monotonic()
     fill_report = _fill_pdf_document_report(
         pdf_path=pdf_path,
         output_pdf_path=output_pdf_path,
@@ -951,17 +980,23 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         alias_map=alias_map.alias_to_field,
         enforce_logic=(mode == "demo"),
     )
+    fill_ms = int((time.monotonic() - fill_ms_start) * 1000)
     fill_log = fill_report["fill_log"]
     unresolved = [k for k, status in fill_log.items() if not status.startswith("ok:")]
     logic_issues = _detect_logic_issues(output_pdf_path)
     repair_summary: dict[str, Any] | None = None
+    repair_ms = 0
     if auto_fix_logic and logic_issues:
+        repair_ms_start = time.monotonic()
         repair_summary = _auto_fix_logic_issues(output_pdf_path)
         logic_issues = _detect_logic_issues(output_pdf_path)
+        repair_ms = int((time.monotonic() - repair_ms_start) * 1000)
+    validate_ms_start = time.monotonic()
     try:
         metrics = _basic_fill_metrics(output_pdf_path)
     except ImportError as exc:
         return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
+    validate_ms = int((time.monotonic() - validate_ms_start) * 1000)
     quality_score = round(
         max(
             0.0,
@@ -998,6 +1033,18 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         "repair_summary": repair_summary,
         "fill_ratio": metrics["fill_ratio"],
         "quality_score": quality_score,
+        "process_report": {
+            "used_annotation_vision": False,
+            "used_semantic_analysis": True,
+            "mode": mode,
+            "stage_timings_ms": {
+                "analyze": analyze_ms,
+                "fill": fill_ms,
+                "repair": repair_ms,
+                "validate": validate_ms,
+                "total": int((time.monotonic() - t0) * 1000),
+            },
+        },
     }
 
     content: list[TextContent | ImageContent] = [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -1146,6 +1193,7 @@ def _workflow_guide() -> list[TextContent]:
         "tool_aliases": {
             "prepare_form_for_analysis": "extract_form_fields",
             "fill_this_pdf": "fill_pdf_form",
+            "fill_pdf_now": "fill_pdf_form",
         },
         "templates": {
             "analyze_form": {
@@ -1175,6 +1223,10 @@ def _workflow_guide() -> list[TextContent]:
                 "values_json": "{\"F001\":\"Alice Example\"}",
                 "alias_map_json": "{\"F001\":\"field.name\"}",
                 "output_pdf_path": "/optional/path/filled.pdf",
+            },
+            "fill_pdf_now": {
+                "pdf_path": "/path/to/form.pdf",
+                "values_json": "{\"F001\":\"Alice Example\"}",
             },
             "complete_form": {
                 "session_id": "<optional>",
@@ -1224,6 +1276,7 @@ def _workflow_guide() -> list[TextContent]:
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
             "Use fill_with_demo_data for the fastest demo-only path.",
             "Use one_shot_fill_form for the fastest configurable end-to-end path (analyze + fill + validate + auto-fix).",
+            "Use fill_pdf_now / fill_this_pdf for direct field-value fills when you already have values_json.",
             "Use complete_form for a configurable single-call pipeline with strict_validation and auto_fix_logic.",
             "Use fill_form if you only have semantic keys and want auto-mapping.",
             "annotate_pages=true returns annotated images directly; no separate local annotation script is required.",

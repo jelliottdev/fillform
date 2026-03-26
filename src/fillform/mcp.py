@@ -1217,21 +1217,34 @@ def _fill_pdf_document_report(
     fill_log: dict[str, str] = {}
     changed_fields: list[dict[str, str]] = []
     with fitz.open(str(pdf_path)) as doc:
-        widgets_by_name: dict[str, Any] = {}
+        widgets_by_name: dict[str, list[Any]] = {}
         for page in doc:
             for widget in page.widgets() or []:
                 if widget.field_name:
-                    widgets_by_name[str(widget.field_name)] = widget
+                    widgets_by_name.setdefault(str(widget.field_name), []).append(widget)
 
         for key, raw_value in values.items():
             key_str = str(key)
             field_name = alias_map.get(key_str, key_str)
-            widget = widgets_by_name.get(field_name)
-            if widget is None:
+            widgets = widgets_by_name.get(field_name) or []
+            if not widgets:
                 fill_log[key_str] = f"missing_field:{field_name}"
                 continue
-            if isinstance(raw_value, bool):
-                value = "Yes" if raw_value else "Off"
+
+            if len(widgets) > 1:
+                status = _set_widget_group_value(
+                    widgets=widgets,
+                    raw_value=raw_value,
+                    input_key=key_str,
+                    field_name=field_name,
+                    changed_fields=changed_fields,
+                )
+                fill_log[key_str] = status
+                continue
+
+            widget = widgets[0]
+            if isinstance(raw_value, bool) and _is_checkbox_widget(widget):
+                value = _checkbox_target_value(widget, raw_value)
             else:
                 value = "" if raw_value is None else str(raw_value)
             try:
@@ -1258,6 +1271,111 @@ def _fill_pdf_document_report(
         "fill_log": fill_log,
         "changed_fields": changed_fields,
     }
+
+
+def _is_checkbox_widget(widget: Any) -> bool:
+    fts = str(getattr(widget, "field_type_string", "")).lower()
+    return "checkbox" in fts or "button" in fts or str(getattr(widget, "field_type", "")) == "2"
+
+
+def _checkbox_target_value(widget: Any, selected: bool) -> str:
+    if not selected:
+        return "Off"
+    try:
+        if hasattr(widget, "on_state"):
+            return str(widget.on_state())
+    except Exception:
+        pass
+    try:
+        states = widget.button_states() or {}
+        normal = states.get("normal") or []
+        for state in normal:
+            state_s = str(state)
+            if state_s.lower() != "off":
+                return state_s
+    except Exception:
+        pass
+    return "Yes"
+
+
+def _set_widget_group_value(
+    widgets: list[Any],
+    raw_value: Any,
+    input_key: str,
+    field_name: str,
+    changed_fields: list[dict[str, str]],
+) -> str:
+    try:
+        normalized = str(raw_value).strip().lower()
+    except Exception:
+        normalized = ""
+
+    target_idx = 0
+    if isinstance(raw_value, bool):
+        if raw_value:
+            target_idx = _pick_yes_widget_index(widgets)
+        else:
+            target_idx = -1
+    elif normalized in {"yes", "true", "on", "1"}:
+        target_idx = _pick_yes_widget_index(widgets)
+    elif normalized in {"no", "false", "off", "0"}:
+        target_idx = _pick_no_widget_index(widgets)
+    else:
+        explicit = _pick_widget_matching_state(widgets, str(raw_value))
+        if explicit is not None:
+            target_idx = explicit
+
+    try:
+        for idx, widget in enumerate(widgets):
+            before = str(widget.field_value or "")
+            if target_idx == -1:
+                after_value = "Off"
+            elif idx == target_idx:
+                after_value = _checkbox_target_value(widget, True)
+            else:
+                after_value = "Off"
+            widget.field_value = after_value
+            widget.update()
+            after = str(widget.field_value or "")
+            if before != after:
+                changed_fields.append(
+                    {
+                        "input_key": input_key,
+                        "field_name": f"{field_name}[{idx}]",
+                        "before": before,
+                        "after": after,
+                    }
+                )
+    except Exception as exc:
+        return f"error:{field_name}:{exc}"
+    return f"ok:{field_name}"
+
+
+def _pick_widget_matching_state(widgets: list[Any], raw: str) -> int | None:
+    target = raw.strip().lower()
+    for idx, widget in enumerate(widgets):
+        state = _checkbox_target_value(widget, True).lower()
+        if state == target:
+            return idx
+    return None
+
+
+def _pick_yes_widget_index(widgets: list[Any]) -> int:
+    for idx, widget in enumerate(widgets):
+        name = str(getattr(widget, "field_name", "")).lower()
+        on_state = _checkbox_target_value(widget, True).lower()
+        if "yes" in on_state or on_state in {"1", "on", "true"} or "yes" in name:
+            return idx
+    return 0
+
+
+def _pick_no_widget_index(widgets: list[Any]) -> int:
+    for idx, widget in enumerate(widgets):
+        name = str(getattr(widget, "field_name", "")).lower()
+        on_state = _checkbox_target_value(widget, True).lower()
+        if "no" in on_state or on_state in {"0", "off", "false"} or "no" in name:
+            return idx
+    return -1
 
 
 def _demo_value_for_field(label_guess: str, field_type: str) -> str:

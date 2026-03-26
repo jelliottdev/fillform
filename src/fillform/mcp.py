@@ -77,11 +77,9 @@ Usage
 from __future__ import annotations
 
 import base64
-import binascii
 import json
 import math
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -97,6 +95,13 @@ from mcp.types import (
 from .annotator import PdfAnnotator
 from .contracts import CanonicalField, CanonicalSchema
 from .field_alias import AliasMap, FieldAliasRegistry
+from .mcp_support import (
+    PDF_BYTES_DESCRIPTION,
+    create_session,
+    get_session,
+    pdf_source_properties,
+    resolve_pdf_source,
+)
 from .structure import PdfStructureService, TextBlock
 
 # ---------------------------------------------------------------------------
@@ -118,26 +123,6 @@ def _make_structure_service() -> PdfStructureService:
 _structure_service = _make_structure_service()
 _alias_registry = FieldAliasRegistry()
 _annotator = PdfAnnotator()
-_analysis_sessions: dict[str, dict[str, Any]] = {}
-
-
-PDF_BYTES_DESCRIPTION = (
-    "Optional base64-encoded PDF bytes. Use this when file-path rewriting is "
-    "unavailable in proxied mount environments."
-)
-
-
-def _pdf_source_properties(path_description: str) -> dict[str, Any]:
-    return {
-        "pdf_path": {
-            "type": "string",
-            "description": path_description,
-        },
-        "pdf_bytes_base64": {
-            "type": "string",
-            "description": PDF_BYTES_DESCRIPTION,
-        },
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +152,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to the PDF file."),
+                    **pdf_source_properties("Absolute or relative path to the PDF file."),
                     "annotate_pages": {
                         "type": "boolean",
                         "description": "Default false. Set true to attach annotated page images.",
@@ -195,7 +180,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to the PDF file."),
+                    **pdf_source_properties("Absolute or relative path to the PDF file."),
                     "annotate_pages": {
                         "type": "boolean",
                         "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
@@ -300,7 +285,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to source PDF."),
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "values_json": {
                         "description": (
                             "Field values to apply. Accepts either a JSON string or an object. "
@@ -345,7 +330,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to source PDF."),
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "mode": {
                         "type": "string",
                         "description": "Either 'user_data' (default) or 'demo'.",
@@ -380,7 +365,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to source PDF."),
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "semantic_data_json": {
                         "oneOf": [{"type": "string"}, {"type": "object"}],
                         "description": "Semantic key/value payload.",
@@ -399,7 +384,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    **_pdf_source_properties("Absolute or relative path to source PDF."),
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "expected_min_fill_ratio": {
                         "type": "number",
                         "default": 0.6,
@@ -441,7 +426,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
 async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageContent]:
     try:
-        pdf_path = _resolve_pdf_source(args)
+        pdf_path = resolve_pdf_source(args)
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     annotate_pages = bool(args.get("annotate_pages", False))
@@ -515,7 +500,7 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
         },
     }
     if bool(args.get("persist_session", True)):
-        session_id = _create_session(
+        session_id = create_session(
             pdf_path=pdf_path,
             alias_map=alias_map.alias_to_field,
         )
@@ -547,7 +532,7 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
 
 async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
     try:
-        pdf_path = _resolve_pdf_source(args)
+        pdf_path = resolve_pdf_source(args)
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     annotate_pages = bool(args.get("annotate_pages", False))
@@ -624,7 +609,7 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
         },
     }
     if bool(args.get("persist_session", True)):
-        session_id = _create_session(pdf_path=pdf_path, alias_map=alias_map.alias_to_field)
+        session_id = create_session(pdf_path=pdf_path, alias_map=alias_map.alias_to_field)
         result["session_id"] = session_id
         result["session_expires_note"] = "In-memory session, valid while this MCP process is alive."
 
@@ -648,7 +633,7 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
 
 
 async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
+    session = get_session(args.get("session_id"))
     pdf_path_str = args.get("pdf_path") or (session.get("pdf_path") if session else "")
     form_family = str(args.get("form_family") or "unknown")
     version = str(args.get("version") or "1")
@@ -732,9 +717,9 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
+    session = get_session(args.get("session_id"))
     try:
-        pdf_path = _resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
@@ -792,9 +777,9 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    session = _get_session(args.get("session_id"))
+    session = get_session(args.get("session_id"))
     try:
-        pdf_path = _resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
@@ -878,9 +863,9 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
 
 
 async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
+    session = get_session(args.get("session_id"))
     try:
-        pdf_path = _resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
@@ -921,7 +906,7 @@ async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
 
 async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
     try:
-        pdf_path = _resolve_pdf_source(args)
+        pdf_path = resolve_pdf_source(args)
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
@@ -1200,44 +1185,6 @@ def _map_semantic_data_to_aliases(
 def _tokenize(text: str) -> list[str]:
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
     return [tok for tok in cleaned.split() if tok]
-
-
-def _create_session(pdf_path: Path, alias_map: dict[str, str]) -> str:
-    session_id = str(uuid.uuid4())
-    _analysis_sessions[session_id] = {
-        "pdf_path": str(pdf_path),
-        "alias_map": dict(alias_map),
-    }
-    # Avoid unbounded growth in long-lived processes.
-    if len(_analysis_sessions) > 100:
-        for key in list(_analysis_sessions.keys())[:20]:
-            _analysis_sessions.pop(key, None)
-    return session_id
-
-
-def _get_session(session_id: Any) -> dict[str, Any] | None:
-    if not session_id:
-        return None
-    sid = str(session_id)
-    return _analysis_sessions.get(sid)
-
-
-def _resolve_pdf_source(args: dict[str, Any], default_path: str | None = None) -> Path:
-    if args.get("pdf_bytes_base64"):
-        b64_payload = str(args["pdf_bytes_base64"])
-        try:
-            payload = base64.b64decode(b64_payload, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError(f"pdf_bytes_base64 is not valid base64: {exc}") from exc
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        tmp.write(payload)
-        tmp.close()
-        return Path(tmp.name).resolve()
-
-    candidate = args.get("pdf_path") or default_path
-    if not candidate:
-        raise ValueError("Provide either pdf_path or pdf_bytes_base64.")
-    return Path(str(candidate)).expanduser().resolve()
 
 
 # ---------------------------------------------------------------------------

@@ -219,6 +219,28 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
+        Tool(
             name="save_field_mapping",
             description=(
                 "Persist the field analysis produced by Claude into a CanonicalSchema "

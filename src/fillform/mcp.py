@@ -215,55 +215,6 @@ async def list_tools() -> list[Tool]:
                         "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
                         "default": False,
                     },
-                    "persist_session": {
-                        "type": "boolean",
-                        "description": "Default true. Persist alias map/pdf path in server memory and return a session_id for follow-up calls.",
-                        "default": True,
-                    },
-                },
-                "required": ["pdf_path"],
-            },
-        ),
-        Tool(
-            name="prepare_form_for_analysis",
-            description=(
-                "Alias for extract_form_fields (same inputs/outputs). "
-                "Use this if your agent expects the older tool name."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to the PDF file.",
-                    },
-                    "annotate_pages": {
-                        "type": "boolean",
-                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
-                        "default": False,
-                    },
-                },
-                "required": ["pdf_path"],
-            },
-        ),
-        Tool(
-            name="prepare_form_for_analysis",
-            description=(
-                "Alias for extract_form_fields (same inputs/outputs). "
-                "Use this if your agent expects the older tool name."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to the PDF file.",
-                    },
-                    "annotate_pages": {
-                        "type": "boolean",
-                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
-                        "default": False,
-                    },
                 },
                 "required": ["pdf_path"],
             },
@@ -373,6 +324,30 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="fill_this_pdf",
+            description=(
+                "Alias for fill_pdf_form. Use this if your agent expects a plain-language "
+                "\"fill this PDF\" action."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
+                    "values_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Alias/value or field-name/value mapping.",
+                    },
+                    "alias_map_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Optional alias map for FXXX keys.",
+                    },
+                    "session_id": {"type": "string"},
+                    "output_pdf_path": {"type": "string"},
+                },
+                "required": ["values_json"],
+            },
+        ),
+        Tool(
             name="complete_form",
             description=(
                 "One-call pipeline for analyze + fill + completion report. "
@@ -445,6 +420,31 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="map_fill_validate",
+            description=(
+                "One-call orchestration: analyze + fill + validate. "
+                "Use mode='demo' to auto-generate believable demo values."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
+                    "mode": {
+                        "type": "string",
+                        "description": "Either 'user_data' (default) or 'demo'.",
+                        "default": "user_data",
+                    },
+                    "data_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "output_pdf_path": {"type": "string"},
+                    "preview_pages": {"type": "boolean", "default": False},
+                    "expected_min_fill_ratio": {"type": "number", "default": 0.6},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -466,12 +466,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _save_mapping(arguments)
     if name == "fill_pdf_form":
         return await _fill_pdf_form(arguments)
+    if name == "fill_this_pdf":
+        return await _fill_pdf_form(arguments)
     if name == "complete_form":
         return await _complete_form(arguments)
     if name == "fill_form":
         return await _fill_form(arguments)
     if name == "validate_form":
         return await _validate_form(arguments)
+    if name == "map_fill_validate":
+        return await _map_fill_validate(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -803,12 +807,13 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
     except ImportError as exc:
         return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
 
-    fill_log = _fill_pdf_document(
+    fill_report = _fill_pdf_document_report(
         pdf_path=pdf_path,
         output_pdf_path=output_pdf_path,
         values=values,
         alias_map=alias_map,
     )
+    fill_log = fill_report["fill_log"]
 
     return [
         TextContent(
@@ -820,6 +825,7 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
                     "filled": sum(1 for v in fill_log.values() if v.startswith("ok:")),
                     "total_values": len(values),
                     "fill_log": fill_log,
+                    "changed_fields": fill_report["changed_fields"],
                 },
                 indent=2,
             ),
@@ -877,12 +883,13 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
     fill_values = dict(generated_demo_values)
     fill_values.update(provided_values)
 
-    fill_log = _fill_pdf_document(
+    fill_report = _fill_pdf_document_report(
         pdf_path=pdf_path,
         output_pdf_path=output_pdf_path,
         values=fill_values,
         alias_map=alias_map.alias_to_field,
     )
+    fill_log = fill_report["fill_log"]
     unresolved = [k for k, status in fill_log.items() if not status.startswith("ok:")]
     result = {
         "mode": mode,
@@ -900,6 +907,7 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
             "No unresolved fields detected." if not unresolved else
             "Review unresolved_fields and rerun with corrected data_json."
         ),
+        "changed_fields": fill_report["changed_fields"][:200],
     }
 
     content: list[TextContent | ImageContent] = [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -939,12 +947,13 @@ async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
         alias_map=alias_map.alias_to_field,
         structure=structure,
     )
-    fill_log = _fill_pdf_document(
+    fill_report = _fill_pdf_document_report(
         pdf_path=pdf_path,
         output_pdf_path=output_pdf_path,
         values=mapped_values,
         alias_map=alias_map.alias_to_field,
     )
+    fill_log = fill_report["fill_log"]
     return [TextContent(type="text", text=json.dumps({
         "source_pdf": str(pdf_path),
         "output_pdf": str(output_pdf_path),
@@ -952,6 +961,7 @@ async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
         "mapped_fields": len(mapped_values),
         "mapping_report": mapping_report,
         "fill_log": fill_log,
+        "changed_fields": fill_report["changed_fields"][:200],
     }, indent=2))]
 
 
@@ -996,6 +1006,43 @@ async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
+async def _map_fill_validate(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    completed = await _complete_form(args)
+    if not completed:
+        return [TextContent(type="text", text="ERROR: complete_form returned no result")]
+
+    first = completed[0]
+    if not isinstance(first, TextContent):
+        return [TextContent(type="text", text="ERROR: complete_form returned unexpected payload")]
+
+    try:
+        complete_payload = json.loads(first.text)
+    except json.JSONDecodeError:
+        return [TextContent(type="text", text="ERROR: complete_form response was not valid JSON")]
+
+    validate_args = {
+        "pdf_path": complete_payload.get("output_pdf"),
+        "expected_min_fill_ratio": args.get("expected_min_fill_ratio", 0.6),
+    }
+    validation = await _validate_form(validate_args)
+    if not validation:
+        return completed
+
+    validation_text = validation[0].text if isinstance(validation[0], TextContent) else "{}"
+    try:
+        validation_payload = json.loads(validation_text)
+    except json.JSONDecodeError:
+        validation_payload = {"raw": validation_text}
+
+    merged = {
+        "pipeline": "map_fill_validate",
+        "complete_form": complete_payload,
+        "validation": validation_payload,
+    }
+    tail = completed[1:] if len(completed) > 1 else []
+    return [TextContent(type="text", text=json.dumps(merged, indent=2)), *tail]
+
+
 def _coerce_json_object(value: Any, field_name: str) -> dict[str, Any]:
     if isinstance(value, dict):
         return {str(k): v for k, v in value.items()}
@@ -1014,10 +1061,11 @@ def _workflow_guide() -> list[TextContent]:
     payload = {
         "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
         "recommended_tool_order": [
-            "complete_form (or: analyze_form -> save_field_mapping -> fill_pdf_form)",
+            "map_fill_validate (or: complete_form / fill_pdf_form / validate_form)",
         ],
         "tool_aliases": {
             "prepare_form_for_analysis": "extract_form_fields",
+            "fill_this_pdf": "fill_pdf_form",
         },
         "templates": {
             "analyze_form": {
@@ -1070,6 +1118,12 @@ def _workflow_guide() -> list[TextContent]:
                 "pdf_bytes_base64": "<optional base64 bytes>",
                 "expected_min_fill_ratio": 0.6,
             },
+            "map_fill_validate": {
+                "pdf_path": "/path/to/form.pdf",
+                "mode": "demo",
+                "preview_pages": True,
+                "expected_min_fill_ratio": 0.6,
+            },
         },
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
@@ -1079,6 +1133,7 @@ def _workflow_guide() -> list[TextContent]:
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
             "Use complete_form for a single-call pipeline with explicit completion_status.",
             "Use fill_form if you only have semantic keys and want auto-mapping.",
+            "annotate_pages=true returns annotated images directly; no separate local annotation script is required.",
         ],
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
@@ -1143,9 +1198,24 @@ def _fill_pdf_document(
     values: dict[str, Any],
     alias_map: dict[str, str],
 ) -> dict[str, str]:
+    return _fill_pdf_document_report(
+        pdf_path=pdf_path,
+        output_pdf_path=output_pdf_path,
+        values=values,
+        alias_map=alias_map,
+    )["fill_log"]
+
+
+def _fill_pdf_document_report(
+    pdf_path: Path,
+    output_pdf_path: Path,
+    values: dict[str, Any],
+    alias_map: dict[str, str],
+) -> dict[str, Any]:
     import fitz
 
     fill_log: dict[str, str] = {}
+    changed_fields: list[dict[str, str]] = []
     with fitz.open(str(pdf_path)) as doc:
         widgets_by_name: dict[str, Any] = {}
         for page in doc:
@@ -1160,17 +1230,34 @@ def _fill_pdf_document(
             if widget is None:
                 fill_log[key_str] = f"missing_field:{field_name}"
                 continue
-            value = "" if raw_value is None else str(raw_value)
+            if isinstance(raw_value, bool):
+                value = "Yes" if raw_value else "Off"
+            else:
+                value = "" if raw_value is None else str(raw_value)
             try:
+                before = str(widget.field_value or "")
                 widget.field_value = value
                 widget.update()
+                after = str(widget.field_value or "")
                 fill_log[key_str] = f"ok:{field_name}"
+                if before != after:
+                    changed_fields.append(
+                        {
+                            "input_key": key_str,
+                            "field_name": field_name,
+                            "before": before,
+                            "after": after,
+                        }
+                    )
             except Exception as exc:
                 fill_log[key_str] = f"error:{field_name}:{exc}"
 
         output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
         doc.save(str(output_pdf_path))
-    return fill_log
+    return {
+        "fill_log": fill_log,
+        "changed_fields": changed_fields,
+    }
 
 
 def _demo_value_for_field(label_guess: str, field_type: str) -> str:

@@ -5,6 +5,7 @@ import binascii
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from typing import Any
 
 PDF_BYTES_DESCRIPTION = (
@@ -62,4 +63,30 @@ def resolve_pdf_source(args: dict[str, Any], default_path: str | None = None) ->
     candidate = args.get("pdf_path") or default_path
     if not candidate:
         raise ValueError("Provide either pdf_path or pdf_bytes_base64.")
-    return Path(str(candidate)).expanduser().resolve()
+    return _normalize_pdf_path(str(candidate))
+
+
+def _normalize_pdf_path(candidate: str) -> Path:
+    raw = candidate.strip()
+    if not raw:
+        raise ValueError("pdf_path was empty.")
+
+    # Handle URL-like wrappers that appear in some MCP runtimes.
+    if raw.startswith("sandbox:"):
+        raw = raw.removeprefix("sandbox:")
+    elif raw.startswith("file://"):
+        parsed = urlparse(raw)
+        raw = unquote(parsed.path or "")
+
+    path = Path(raw).expanduser().resolve()
+    if path.exists():
+        return path
+
+    # Common proxied-mount fallback: paths sometimes arrive as `/mnt/data/...`
+    # even when the file is materialized into a local working directory.
+    if raw.startswith("/mnt/data/"):
+        fallback = Path(raw.removeprefix("/mnt/data/")).expanduser().resolve()
+        if fallback.exists():
+            return fallback
+
+    return path

@@ -1271,6 +1271,7 @@ def _workflow_guide() -> list[TextContent]:
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
             "If proxied mount path rewriting fails, pass pdf_bytes_base64 instead of pdf_path.",
+            "pdf_path also accepts sandbox:/... and file://... path wrappers.",
             "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",

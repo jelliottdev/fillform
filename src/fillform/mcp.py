@@ -80,6 +80,7 @@ import base64
 import json
 import math
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -116,6 +117,7 @@ def _make_structure_service() -> PdfStructureService:
 _structure_service = _make_structure_service()
 _alias_registry = FieldAliasRegistry()
 _annotator = PdfAnnotator()
+_analysis_sessions: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,33 @@ async def list_tools() -> list[Tool]:
                         "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
                         "default": False,
                     },
+                    "persist_session": {
+                        "type": "boolean",
+                        "description": "Default true. Persist alias map/pdf path in server memory and return a session_id for follow-up calls.",
+                        "default": True,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
+        Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
                 },
                 "required": ["pdf_path"],
             },
@@ -225,6 +254,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Path to the original PDF (used to derive default output paths).",
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: session_id returned by extract_form_fields/analyze_form to avoid re-sending alias_map_json.",
+                    },
                     "alias_map_json": {
                         "description": (
                             "Alias map from extract_form_fields. Accepts either a JSON string "
@@ -263,7 +296,7 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["alias_map_json", "field_analysis_json"],
+                "required": ["field_analysis_json"],
             },
         ),
         Tool(
@@ -298,6 +331,10 @@ async def list_tools() -> list[Tool]:
                             {"type": "string"},
                             {"type": "object"},
                         ],
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: session_id returned by extract_form_fields/analyze_form.",
                     },
                     "output_pdf_path": {
                         "type": "string",
@@ -474,6 +511,7 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
         ),
         "next_call_templates": {
             "save_field_mapping": {
+                "session_id": "<optional session_id>",
                 "alias_map_json": "<paste alias_map_json>",
                 "field_analysis_json": "{\"F001\": {\"label\": \"...\", \"context\": \"...\", \"expected_value_type\": \"string\", \"expected_format\": null, \"is_required\": false, \"section\": null}}",
                 "form_family": "unknown",
@@ -482,10 +520,18 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
             "fill_pdf_form": {
                 "pdf_path": str(pdf_path),
                 "values_json": "{\"F001\": \"value\"}",
+                "session_id": "<optional session_id>",
                 "alias_map_json": "<paste alias_map_json when using FXXX keys>",
             },
         },
     }
+    if bool(args.get("persist_session", True)):
+        session_id = _create_session(
+            pdf_path=pdf_path,
+            alias_map=alias_map.alias_to_field,
+        )
+        result["session_id"] = session_id
+        result["session_expires_note"] = "In-memory session, valid while this MCP process is alive."
 
     content: list[TextContent | ImageContent] = [
         TextContent(type="text", text=json.dumps(result, indent=2))
@@ -585,6 +631,10 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
             "fill_pdf_form": "After collecting user data, pass values_json and alias_map_json.",
         },
     }
+    if bool(args.get("persist_session", True)):
+        session_id = _create_session(pdf_path=pdf_path, alias_map=alias_map.alias_to_field)
+        result["session_id"] = session_id
+        result["session_expires_note"] = "In-memory session, valid while this MCP process is alive."
 
     content: list[TextContent | ImageContent] = [
         TextContent(type="text", text=json.dumps(result, indent=2))
@@ -606,7 +656,8 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
 
 
 async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
-    pdf_path_str = args.get("pdf_path") or ""
+    session = _get_session(args.get("session_id"))
+    pdf_path_str = args.get("pdf_path") or (session.get("pdf_path") if session else "")
     form_family = str(args.get("form_family") or "unknown")
     version = str(args.get("version") or "1")
 
@@ -617,10 +668,14 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
         output_dir = Path(args.get("output_dir") or "/tmp").expanduser().resolve()
 
     # Parse alias map
-    try:
-        alias_map_raw = _coerce_json_object(args.get("alias_map_json"), "alias_map_json")
-    except ValueError as exc:
-        return [TextContent(type="text", text=f"ERROR: {exc}")]
+    alias_map_raw: dict[str, Any]
+    if args.get("alias_map_json") is None and session:
+        alias_map_raw = dict(session["alias_map"])
+    else:
+        try:
+            alias_map_raw = _coerce_json_object(args.get("alias_map_json"), "alias_map_json")
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
 
     # Parse field analysis
     try:
@@ -685,7 +740,8 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
-    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    session = _get_session(args.get("session_id"))
+    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
 
@@ -708,6 +764,8 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
                 alias_map = {str(k): str(v) for k, v in alias_map_raw.items()}
         except ValueError as exc:
             return [TextContent(type="text", text=f"ERROR: {exc}")]
+    elif session:
+        alias_map = dict(session["alias_map"])
 
     try:
         import fitz
@@ -739,7 +797,8 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    session = _get_session(args.get("session_id"))
+    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
 
@@ -821,7 +880,8 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
 
 
 async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
-    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    session = _get_session(args.get("session_id"))
+    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
     output_pdf_path = Path(
@@ -924,12 +984,14 @@ def _workflow_guide() -> list[TextContent]:
                 "pdf_path": "/path/to/form.pdf",
                 "annotate_pages": True,
                 "ambiguity_threshold": 0.72,
+                "persist_session": True,
             },
             "extract_form_fields": {
                 "pdf_path": "/path/to/form.pdf",
                 "annotate_pages": True,
             },
             "save_field_mapping": {
+                "session_id": "<preferred>",
                 "pdf_path": "/path/to/form.pdf",
                 "alias_map_json": "{\"F001\":\"field.name\"}",
                 "field_analysis_json": "{\"F001\":{\"label\":\"...\",\"context\":\"...\",\"expected_value_type\":\"string\",\"expected_format\":null,\"is_required\":false,\"section\":null}}",
@@ -937,17 +999,20 @@ def _workflow_guide() -> list[TextContent]:
                 "version": "1",
             },
             "fill_pdf_form": {
+                "session_id": "<preferred>",
                 "pdf_path": "/path/to/form.pdf",
                 "values_json": "{\"F001\":\"Alice Example\"}",
                 "alias_map_json": "{\"F001\":\"field.name\"}",
                 "output_pdf_path": "/optional/path/filled.pdf",
             },
             "complete_form": {
+                "session_id": "<optional>",
                 "pdf_path": "/path/to/form.pdf",
                 "mode": "demo",
                 "preview_pages": True,
             },
             "fill_form": {
+                "session_id": "<optional>",
                 "pdf_path": "/path/to/form.pdf",
                 "semantic_data_json": {
                     "full_name": "Jordan Demo",
@@ -962,6 +1027,7 @@ def _workflow_guide() -> list[TextContent]:
         },
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
+            "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
             "Use complete_form for a single-call pipeline with explicit completion_status.",
@@ -1123,6 +1189,26 @@ def _map_semantic_data_to_aliases(
 def _tokenize(text: str) -> list[str]:
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
     return [tok for tok in cleaned.split() if tok]
+
+
+def _create_session(pdf_path: Path, alias_map: dict[str, str]) -> str:
+    session_id = str(uuid.uuid4())
+    _analysis_sessions[session_id] = {
+        "pdf_path": str(pdf_path),
+        "alias_map": dict(alias_map),
+    }
+    # Avoid unbounded growth in long-lived processes.
+    if len(_analysis_sessions) > 100:
+        for key in list(_analysis_sessions.keys())[:20]:
+            _analysis_sessions.pop(key, None)
+    return session_id
+
+
+def _get_session(session_id: Any) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    sid = str(session_id)
+    return _analysis_sessions.get(sid)
 
 
 # ---------------------------------------------------------------------------

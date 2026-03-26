@@ -79,6 +79,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -378,6 +379,41 @@ async def list_tools() -> list[Tool]:
                         "description": "Default false. Attach filled-page preview images.",
                         "default": False,
                     },
+                    "strict_validation": {
+                        "type": "boolean",
+                        "description": "Default true. Mark completion as partial when logic issues are detected.",
+                        "default": True,
+                    },
+                    "auto_fix_logic": {
+                        "type": "boolean",
+                        "description": "Default true. Apply one repair pass to clear contradictory conditional text.",
+                        "default": True,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="one_shot_fill_form",
+            description=(
+                "Fast one-shot endpoint: analyze + fill + validate + auto-fix. "
+                "Use mode='demo' for high-quality synthetic form completion with minimal orchestration."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
+                    "mode": {
+                        "type": "string",
+                        "description": "Either 'user_data' or 'demo'. Default 'demo'.",
+                        "default": "demo",
+                    },
+                    "data_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Optional payload when mode='user_data'.",
+                    },
+                    "output_pdf_path": {"type": "string"},
+                    "preview_pages": {"type": "boolean", "default": False},
                 },
                 "required": [],
             },
@@ -470,6 +506,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _fill_pdf_form(arguments)
     if name == "complete_form":
         return await _complete_form(arguments)
+    if name == "one_shot_fill_form":
+        one_shot_args = dict(arguments)
+        one_shot_args.setdefault("mode", "demo")
+        one_shot_args.setdefault("strict_validation", True)
+        one_shot_args.setdefault("auto_fix_logic", True)
+        return await _complete_form(one_shot_args)
     if name == "fill_form":
         return await _fill_form(arguments)
     if name == "validate_form":
@@ -847,6 +889,8 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         mode = "user_data"
 
     preview_pages = bool(args.get("preview_pages", False))
+    strict_validation = bool(args.get("strict_validation", True))
+    auto_fix_logic = bool(args.get("auto_fix_logic", True))
     output_pdf_path = Path(
         str(args.get("output_pdf_path") or (pdf_path.parent / f"{pdf_path.stem}_completed.pdf"))
     ).expanduser().resolve()
@@ -888,9 +932,30 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         output_pdf_path=output_pdf_path,
         values=fill_values,
         alias_map=alias_map.alias_to_field,
+        enforce_logic=(mode == "demo"),
     )
     fill_log = fill_report["fill_log"]
     unresolved = [k for k, status in fill_log.items() if not status.startswith("ok:")]
+    logic_issues = _detect_logic_issues(output_pdf_path)
+    repair_summary: dict[str, Any] | None = None
+    if auto_fix_logic and logic_issues:
+        repair_summary = _auto_fix_logic_issues(output_pdf_path)
+        logic_issues = _detect_logic_issues(output_pdf_path)
+    try:
+        metrics = _basic_fill_metrics(output_pdf_path)
+    except ImportError as exc:
+        return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
+    quality_score = round(
+        max(
+            0.0,
+            min(
+                1.0,
+                metrics["fill_ratio"] - (0.08 * len(unresolved)) - (0.12 * len(logic_issues)),
+            ),
+        ),
+        3,
+    )
+    completion_is_complete = (not unresolved) and (not strict_validation or not logic_issues)
     result = {
         "mode": mode,
         "source_pdf": str(pdf_path),
@@ -900,14 +965,22 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         "filled_successfully": sum(1 for status in fill_log.values() if status.startswith("ok:")),
         "unresolved_count": len(unresolved),
         "unresolved_fields": unresolved[:50],
-        "completion_status": "complete" if not unresolved else "partial",
+        "completion_status": "complete" if completion_is_complete else "partial",
         "demo_values_generated": len(generated_demo_values),
         "alias_map_json": json.dumps(alias_map.alias_to_field),
+        "strict_validation": strict_validation,
+        "auto_fix_logic": auto_fix_logic,
         "review_recommendation": (
-            "No unresolved fields detected." if not unresolved else
-            "Review unresolved_fields and rerun with corrected data_json."
+            "No unresolved fields detected."
+            if completion_is_complete
+            else "Review unresolved_fields/logic_issues and rerun with corrected data_json."
         ),
         "changed_fields": fill_report["changed_fields"][:200],
+        "logic_issues_count": len(logic_issues),
+        "logic_issues_sample": logic_issues[:25],
+        "repair_summary": repair_summary,
+        "fill_ratio": metrics["fill_ratio"],
+        "quality_score": quality_score,
     }
 
     content: list[TextContent | ImageContent] = [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -974,26 +1047,11 @@ async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
     expected_min_fill_ratio = float(args.get("expected_min_fill_ratio", 0.6))
     expected_min_fill_ratio = max(0.0, min(1.0, expected_min_fill_ratio))
+
     try:
-        import fitz
+        total, populated, fill_ratio, likely_empty = _basic_fill_metrics(pdf_path)
     except ImportError as exc:
         return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
-
-    total = 0
-    populated = 0
-    likely_empty: list[dict[str, Any]] = []
-    with fitz.open(str(pdf_path)) as doc:
-        for page_index, page in enumerate(doc, start=1):
-            for widget in page.widgets() or []:
-                if not widget.field_name:
-                    continue
-                total += 1
-                value = str(widget.field_value or "").strip()
-                if value:
-                    populated += 1
-                else:
-                    likely_empty.append({"field_name": str(widget.field_name), "page": page_index})
-    fill_ratio = (populated / total) if total else 0.0
     result = {
         "pdf_path": str(pdf_path),
         "total_fields": total,
@@ -1003,6 +1061,11 @@ async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
         "expected_min_fill_ratio": expected_min_fill_ratio,
         "likely_empty_fields_sample": likely_empty[:50],
     }
+    logic_issues = _detect_logic_issues(pdf_path)
+    result["logic_issues_count"] = len(logic_issues)
+    result["logic_issues_sample"] = logic_issues[:50]
+    if logic_issues and result["status"] == "pass":
+        result["status"] = "warn"
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
@@ -1061,7 +1124,7 @@ def _workflow_guide() -> list[TextContent]:
     payload = {
         "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
         "recommended_tool_order": [
-            "map_fill_validate (or: complete_form / fill_pdf_form / validate_form)",
+            "one_shot_fill_form (or: complete_form / map_fill_validate)",
         ],
         "tool_aliases": {
             "prepare_form_for_analysis": "extract_form_fields",
@@ -1102,6 +1165,13 @@ def _workflow_guide() -> list[TextContent]:
                 "pdf_bytes_base64": "<optional base64 bytes>",
                 "mode": "demo",
                 "preview_pages": True,
+                "strict_validation": True,
+                "auto_fix_logic": True,
+            },
+            "one_shot_fill_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "mode": "demo",
+                "preview_pages": True,
             },
             "fill_form": {
                 "session_id": "<optional>",
@@ -1131,7 +1201,8 @@ def _workflow_guide() -> list[TextContent]:
             "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
-            "Use complete_form for a single-call pipeline with explicit completion_status.",
+            "Use one_shot_fill_form for the fastest end-to-end path (analyze + fill + validate + auto-fix).",
+            "Use complete_form for a configurable single-call pipeline with strict_validation and auto_fix_logic.",
             "Use fill_form if you only have semantic keys and want auto-mapping.",
             "annotate_pages=true returns annotated images directly; no separate local annotation script is required.",
         ],
@@ -1211,6 +1282,8 @@ def _fill_pdf_document_report(
     output_pdf_path: Path,
     values: dict[str, Any],
     alias_map: dict[str, str],
+    *,
+    enforce_logic: bool = False,
 ) -> dict[str, Any]:
     import fitz
 
@@ -1223,9 +1296,22 @@ def _fill_pdf_document_report(
                 if widget.field_name:
                     widgets_by_name.setdefault(str(widget.field_name), []).append(widget)
 
+        resolved_values: list[tuple[str, str, Any]] = []
+        field_values_by_name: dict[str, Any] = {}
         for key, raw_value in values.items():
             key_str = str(key)
             field_name = alias_map.get(key_str, key_str)
+            resolved_values.append((key_str, field_name, raw_value))
+            field_values_by_name[field_name] = raw_value
+
+        if enforce_logic:
+            _apply_conditional_field_rules(field_values_by_name, widgets_by_name)
+            normalized: list[tuple[str, str, Any]] = []
+            for key_str, field_name, raw_value in resolved_values:
+                normalized.append((key_str, field_name, field_values_by_name.get(field_name, raw_value)))
+            resolved_values = normalized
+
+        for key_str, field_name, raw_value in resolved_values:
             widgets = widgets_by_name.get(field_name) or []
             if not widgets:
                 fill_log[key_str] = f"missing_field:{field_name}"
@@ -1378,10 +1464,213 @@ def _pick_no_widget_index(widgets: list[Any]) -> int:
     return -1
 
 
+def _normalize_checkbox_choice(raw_value: Any) -> str | None:
+    if isinstance(raw_value, bool):
+        return "yes" if raw_value else "no"
+    text = str(raw_value or "").strip().lower()
+    if text in {"yes", "true", "on", "1"}:
+        return "yes"
+    if text in {"no", "false", "off", "0"}:
+        return "no"
+    return None
+
+
+def _group_selected_yes_no(widgets: list[Any], raw_value: Any) -> str | None:
+    choice = _normalize_checkbox_choice(raw_value)
+    if choice is not None:
+        return choice
+    explicit = str(raw_value or "").strip().lower()
+    if explicit:
+        for widget in widgets:
+            if _checkbox_target_value(widget, True).strip().lower() == explicit:
+                return "yes"
+    states = {
+        _checkbox_target_value(widget, True).strip().lower()
+        for widget in widgets
+    }
+    has_yes = "yes" in states
+    has_no = "no" in states
+    if has_yes and has_no:
+        return "yes"
+    return None
+
+
+def _apply_conditional_field_rules(
+    field_values_by_name: dict[str, Any],
+    widgets_by_name: dict[str, list[Any]],
+) -> None:
+    for field_name, widgets in widgets_by_name.items():
+        if len(widgets) < 2:
+            continue
+        if field_name not in field_values_by_name:
+            continue
+        selected = _group_selected_yes_no(widgets, field_values_by_name[field_name])
+        if selected != "no":
+            continue
+
+        dependent_match = re.fullmatch(r"check2([a-e])", field_name.strip(), flags=re.IGNORECASE)
+        if dependent_match:
+            suffix = dependent_match.group(1).lower()
+            field_values_by_name[f"Dependant Relation 2{suffix}"] = ""
+            field_values_by_name[f"Dependant age 2{suffix}"] = ""
+            continue
+
+        other_match = re.fullmatch(r"check(\d+)", field_name.strip(), flags=re.IGNORECASE)
+        if other_match:
+            line_num = other_match.group(1)
+            other_field = f"Other {line_num}"
+            if other_field in widgets_by_name or other_field in field_values_by_name:
+                field_values_by_name[other_field] = ""
+
+
+def _detect_logic_issues(pdf_path: Path) -> list[dict[str, Any]]:
+    import fitz
+
+    issues: list[dict[str, Any]] = []
+    with fitz.open(str(pdf_path)) as doc:
+        widgets_by_name: dict[str, list[Any]] = {}
+        text_values: dict[str, str] = {}
+        for page in doc:
+            for widget in page.widgets() or []:
+                name = str(widget.field_name or "")
+                if not name:
+                    continue
+                widgets_by_name.setdefault(name, []).append(widget)
+                if not _is_checkbox_widget(widget):
+                    text_values[name] = str(widget.field_value or "").strip()
+
+        for name, widgets in widgets_by_name.items():
+            if len(widgets) < 2:
+                continue
+            states = {_checkbox_target_value(w, True).strip().lower() for w in widgets}
+            if not ({"yes", "no"} & states):
+                continue
+            selected = _selected_yes_no_from_widgets(widgets)
+            if selected != "no":
+                continue
+
+            dep = re.fullmatch(r"check2([a-e])", name.strip(), flags=re.IGNORECASE)
+            if dep:
+                suffix = dep.group(1).lower()
+                for related in (f"Dependant Relation 2{suffix}", f"Dependant age 2{suffix}"):
+                    if text_values.get(related):
+                        issues.append({
+                            "type": "conditional_text_filled_when_no",
+                            "checkbox_group": name,
+                            "related_field": related,
+                            "value": text_values.get(related),
+                        })
+                continue
+
+            other = re.fullmatch(r"check(\d+)", name.strip(), flags=re.IGNORECASE)
+            if other:
+                related = f"Other {other.group(1)}"
+                if text_values.get(related):
+                    issues.append({
+                        "type": "conditional_text_filled_when_no",
+                        "checkbox_group": name,
+                        "related_field": related,
+                        "value": text_values.get(related),
+                    })
+
+    return issues
+
+
+def _selected_yes_no_from_widgets(widgets: list[Any]) -> str | None:
+    for widget in widgets:
+        current = str(getattr(widget, "field_value", "") or "").strip().lower()
+        if not current or current == "off":
+            continue
+        on_state = _checkbox_target_value(widget, True).strip().lower()
+        if current == on_state:
+            if "no" in on_state:
+                return "no"
+            if "yes" in on_state:
+                return "yes"
+            return "yes"
+    return None
+
+
+def _auto_fix_logic_issues(pdf_path: Path) -> dict[str, Any]:
+    import fitz
+
+    cleared: list[str] = []
+    with fitz.open(str(pdf_path)) as doc:
+        widgets_by_name: dict[str, list[Any]] = {}
+        for page in doc:
+            for widget in page.widgets() or []:
+                name = str(widget.field_name or "")
+                if not name:
+                    continue
+                widgets_by_name.setdefault(name, []).append(widget)
+
+        for name, widgets in widgets_by_name.items():
+            if len(widgets) < 2:
+                continue
+            selected = _selected_yes_no_from_widgets(widgets)
+            if selected != "no":
+                continue
+
+            dep = re.fullmatch(r"check2([a-e])", name.strip(), flags=re.IGNORECASE)
+            if dep:
+                suffix = dep.group(1).lower()
+                for related in (f"Dependant Relation 2{suffix}", f"Dependant age 2{suffix}"):
+                    for widget in widgets_by_name.get(related, []):
+                        before = str(widget.field_value or "").strip()
+                        if before:
+                            widget.field_value = ""
+                            widget.update()
+                            cleared.append(related)
+                continue
+
+            other = re.fullmatch(r"check(\d+)", name.strip(), flags=re.IGNORECASE)
+            if other:
+                related = f"Other {other.group(1)}"
+                for widget in widgets_by_name.get(related, []):
+                    before = str(widget.field_value or "").strip()
+                    if before:
+                        widget.field_value = ""
+                        widget.update()
+                        cleared.append(related)
+
+        if cleared:
+            doc.save(str(pdf_path), incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+    return {
+        "fields_cleared_count": len(cleared),
+        "fields_cleared_sample": sorted(set(cleared))[:25],
+    }
+
+
+def _basic_fill_metrics(pdf_path: Path) -> tuple[int, int, float, list[dict[str, Any]]]:
+    import fitz
+
+    total = 0
+    populated = 0
+    likely_empty: list[dict[str, Any]] = []
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index, page in enumerate(doc, start=1):
+            for widget in page.widgets() or []:
+                if not widget.field_name:
+                    continue
+                total += 1
+                value = str(widget.field_value or "").strip()
+                if value:
+                    populated += 1
+                else:
+                    likely_empty.append({"field_name": str(widget.field_name), "page": page_index})
+    fill_ratio = (populated / total) if total else 0.0
+    return total, populated, fill_ratio, likely_empty
+
+
 def _demo_value_for_field(label_guess: str, field_type: str) -> str:
     text = (label_guess or "").lower()
     if field_type.lower() in {"btn", "checkbox", "button"}:
-        return "Yes"
+        if any(tok in text for tok in ("dependents", "with you", "joint case", "increase", "decrease", "amended")):
+            return "Yes"
+        if any(tok in text for tok in ("separate household", "supplement", "other expenses include")):
+            return "No"
+        return "No"
     if "date" in text:
         return "01/15/2026"
     if "case" in text and "number" in text:

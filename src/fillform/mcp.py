@@ -30,6 +30,10 @@ prepare_form_for_analysis
 fill_pdf_form
     Fill a PDF with user-provided values keyed by FXXX alias or raw field name.
 
+complete_form
+    High-level pipeline: analyze + (optional demo data generation) + fill +
+    completion report in one call.
+
 Usage
 -----
 **stdio** (local process, Claude Code default)::
@@ -299,6 +303,44 @@ async def list_tools() -> list[Tool]:
                 "required": ["pdf_path", "values_json"],
             },
         ),
+        Tool(
+            name="complete_form",
+            description=(
+                "One-call pipeline for analyze + fill + completion report. "
+                "Use mode='demo' to auto-generate believable placeholder values."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to source PDF.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Either 'user_data' (default) or 'demo'.",
+                        "default": "user_data",
+                    },
+                    "data_json": {
+                        "description": (
+                            "Optional semantic/alias values as JSON string or object. "
+                            "When omitted and mode='demo', the tool generates demo values."
+                        ),
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "output_pdf_path": {
+                        "type": "string",
+                        "description": "Optional output path for the filled PDF.",
+                    },
+                    "preview_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Attach filled-page preview images.",
+                        "default": False,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
     ]
 
 
@@ -320,6 +362,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _save_mapping(arguments)
     if name == "fill_pdf_form":
         return await _fill_pdf_form(arguments)
+    if name == "complete_form":
+        return await _complete_form(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -621,32 +665,12 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
     except ImportError as exc:
         return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
 
-    fill_log: dict[str, str] = {}
-    with fitz.open(str(pdf_path)) as doc:
-        widgets_by_name: dict[str, Any] = {}
-        for page in doc:
-            for widget in page.widgets() or []:
-                if widget.field_name:
-                    widgets_by_name[str(widget.field_name)] = widget
-
-        for key, raw_value in values.items():
-            key_str = str(key)
-            field_name = alias_map.get(key_str, key_str)
-            widget = widgets_by_name.get(field_name)
-            if widget is None:
-                fill_log[key_str] = f"missing_field:{field_name}"
-                continue
-
-            value = "" if raw_value is None else str(raw_value)
-            try:
-                widget.field_value = value
-                widget.update()
-                fill_log[key_str] = f"ok:{field_name}"
-            except Exception as exc:
-                fill_log[key_str] = f"error:{field_name}:{exc}"
-
-        output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(output_pdf_path))
+    fill_log = _fill_pdf_document(
+        pdf_path=pdf_path,
+        output_pdf_path=output_pdf_path,
+        values=values,
+        alias_map=alias_map,
+    )
 
     return [
         TextContent(
@@ -663,6 +687,88 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
             ),
         )
     ]
+
+
+async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    mode = str(args.get("mode") or "user_data").strip().lower()
+    if mode not in {"user_data", "demo"}:
+        mode = "user_data"
+
+    preview_pages = bool(args.get("preview_pages", False))
+    output_pdf_path = Path(
+        str(args.get("output_pdf_path") or (pdf_path.parent / f"{pdf_path.stem}_completed.pdf"))
+    ).expanduser().resolve()
+
+    try:
+        structure = _structure_service.extract(pdf_path)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
+
+    if not structure.field_widgets:
+        return [TextContent(type="text", text="ERROR: No AcroForm fields found in this PDF.")]
+
+    alias_map = _alias_registry.assign(structure.field_widgets)
+    provided_values: dict[str, Any] = {}
+    if args.get("data_json") is not None:
+        try:
+            provided_values = _coerce_json_object(args.get("data_json"), "data_json")
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    analyzed_rows: list[dict[str, Any]] = []
+    generated_demo_values: dict[str, str] = {}
+    for alias, widget in sorted(alias_map.field_widgets.items()):
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        label_guess, confidence, _ = _guess_semantics(
+            field_name=widget.name,
+            nearby_text=nearby,
+            field_type=widget.field_type,
+        )
+        analyzed_rows.append({"alias": alias, "field_name": widget.name, "label_guess": label_guess, "confidence": confidence})
+        if mode == "demo" and alias not in provided_values and widget.name not in provided_values:
+            generated_demo_values[alias] = _demo_value_for_field(label_guess, widget.field_type)
+
+    fill_values = dict(generated_demo_values)
+    fill_values.update(provided_values)
+
+    fill_log = _fill_pdf_document(
+        pdf_path=pdf_path,
+        output_pdf_path=output_pdf_path,
+        values=fill_values,
+        alias_map=alias_map.alias_to_field,
+    )
+    unresolved = [k for k, status in fill_log.items() if not status.startswith("ok:")]
+    result = {
+        "mode": mode,
+        "source_pdf": str(pdf_path),
+        "output_pdf": str(output_pdf_path),
+        "fields_detected": len(alias_map.alias_to_field),
+        "values_attempted": len(fill_values),
+        "filled_successfully": sum(1 for status in fill_log.values() if status.startswith("ok:")),
+        "unresolved_count": len(unresolved),
+        "unresolved_fields": unresolved[:50],
+        "completion_status": "complete" if not unresolved else "partial",
+        "demo_values_generated": len(generated_demo_values),
+        "alias_map_json": json.dumps(alias_map.alias_to_field),
+        "review_recommendation": (
+            "No unresolved fields detected." if not unresolved else
+            "Review unresolved_fields and rerun with corrected data_json."
+        ),
+    }
+
+    content: list[TextContent | ImageContent] = [TextContent(type="text", text=json.dumps(result, indent=2))]
+    if preview_pages:
+        try:
+            for i, img_b64 in enumerate(_render_pages(output_pdf_path), start=1):
+                content.append(TextContent(type="text", text=f"--- Filled Form Preview Page {i} ---"))
+                content.append(ImageContent(type="image", data=img_b64, mimeType="image/jpeg"))
+        except Exception as exc:
+            content.append(TextContent(type="text", text=f"WARNING: preview rendering failed: {exc}"))
+    return content
 
 
 def _coerce_json_object(value: Any, field_name: str) -> dict[str, Any]:
@@ -683,9 +789,7 @@ def _workflow_guide() -> list[TextContent]:
     payload = {
         "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
         "recommended_tool_order": [
-            "analyze_form",
-            "save_field_mapping",
-            "fill_pdf_form",
+            "complete_form (or: analyze_form -> save_field_mapping -> fill_pdf_form)",
         ],
         "tool_aliases": {
             "prepare_form_for_analysis": "extract_form_fields",
@@ -713,11 +817,17 @@ def _workflow_guide() -> list[TextContent]:
                 "alias_map_json": "{\"F001\":\"field.name\"}",
                 "output_pdf_path": "/optional/path/filled.pdf",
             },
+            "complete_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "mode": "demo",
+                "preview_pages": True,
+            },
         },
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
+            "Use complete_form for a single-call pipeline with explicit completion_status.",
         ],
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
@@ -774,6 +884,63 @@ def _section_hint(
         return None
     candidates.sort(key=lambda t: t[0])
     return candidates[0][1][:80]
+
+
+def _fill_pdf_document(
+    pdf_path: Path,
+    output_pdf_path: Path,
+    values: dict[str, Any],
+    alias_map: dict[str, str],
+) -> dict[str, str]:
+    import fitz
+
+    fill_log: dict[str, str] = {}
+    with fitz.open(str(pdf_path)) as doc:
+        widgets_by_name: dict[str, Any] = {}
+        for page in doc:
+            for widget in page.widgets() or []:
+                if widget.field_name:
+                    widgets_by_name[str(widget.field_name)] = widget
+
+        for key, raw_value in values.items():
+            key_str = str(key)
+            field_name = alias_map.get(key_str, key_str)
+            widget = widgets_by_name.get(field_name)
+            if widget is None:
+                fill_log[key_str] = f"missing_field:{field_name}"
+                continue
+            value = "" if raw_value is None else str(raw_value)
+            try:
+                widget.field_value = value
+                widget.update()
+                fill_log[key_str] = f"ok:{field_name}"
+            except Exception as exc:
+                fill_log[key_str] = f"error:{field_name}:{exc}"
+
+        output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(output_pdf_path))
+    return fill_log
+
+
+def _demo_value_for_field(label_guess: str, field_type: str) -> str:
+    text = (label_guess or "").lower()
+    if field_type.lower() in {"btn", "checkbox", "button"}:
+        return "Yes"
+    if "date" in text:
+        return "01/15/2026"
+    if "case" in text and "number" in text:
+        return "26-10042"
+    if "zip" in text:
+        return "60601"
+    if "phone" in text:
+        return "(312) 555-0198"
+    if "email" in text:
+        return "demo.filer@example.com"
+    if "name" in text:
+        return "Jordan Avery Demo"
+    if any(tok in text for tok in ("income", "expense", "amount", "total", "rent", "tax", "insurance")):
+        return "450.00"
+    return "Demo Value"
 
 
 # ---------------------------------------------------------------------------

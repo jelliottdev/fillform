@@ -64,44 +64,67 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="extract_form_fields",
             description=(
-                "Extract AcroForm fields from a PDF, assign sequential FXXX aliases "
-                "(F001, F002, …), and return a compact JSON object containing the alias "
-                "map and per-field metadata (page, bounding box, type, nearby text label). "
-                "The response is text-only JSON — no images — so it fits in the context "
-                "window even for large multi-page forms.\n\n"
-                "IMPORTANT — to avoid context overflow:\n"
-                "  1. Prefer file_path over pdf_base64. Passing a path sends ~50 chars; "
-                "     base64-encoding a PDF sends the entire file into the conversation.\n"
-                "  2. Do NOT run 'base64 <file>' in a bash tool — pass file_path directly.\n"
-                "  3. The response includes 'nearby_text' labels extracted from the PDF, "
-                "     which usually identify each field without needing to look at images.\n"
-                "  4. Set annotate_pages=true only as a last resort for forms where "
-                "     nearby_text labels are insufficient (adds JPEG images to response)."
+                "Assign sequential FXXX aliases (F001, F002, …) to AcroForm fields and "
+                "return a compact JSON object with the alias map and per-field metadata "
+                "(page, bbox, type, position). Response is text-only JSON — no images.\n\n"
+                "THREE input modes — use the first one that works:\n\n"
+                "  MODE 1 — fields_json (BEST, zero context cost):\n"
+                "    Extract field data locally with python, pass the JSON string.\n"
+                "    Run this python one-liner first (no output shown in conversation):\n"
+                "      python3 -c \"\n"
+                "import json, sys\n"
+                "try:\n"
+                "    import fitz\n"
+                "    doc = fitz.open('/mnt/user-data/uploads/YOUR_FILE.pdf')\n"
+                "    out = [{'name': w.field_name, 'type': w.field_type_string,\n"
+                "            'page': i, 'bbox': list(w.rect)}\n"
+                "           for i, p in enumerate(doc) for w in (p.widgets() or [])]\n"
+                "except ImportError:\n"
+                "    from pypdf import PdfReader\n"
+                "    r = PdfReader('/mnt/user-data/uploads/YOUR_FILE.pdf')\n"
+                "    out = [{'name': k, 'type': 'Tx', 'page': 0, 'bbox': [0,0,100,20]}\n"
+                "           for k in (r.get_fields() or {})]\n"
+                "sys.stdout.write(json.dumps(out))\n"
+                "      \"\n"
+                "    Then pass the output as fields_json. This outputs ~5KB, not the whole PDF.\n\n"
+                "  MODE 2 — file_path: server reads the file directly.\n"
+                "    Works only if the server can access the path (local server only).\n\n"
+                "  MODE 3 — pdf_base64: AVOID unless modes 1 and 2 both fail.\n"
+                "    Do NOT run 'base64 <file>' in bash — that prints the full file into the\n"
+                "    conversation and causes context overflow. This mode is only viable for\n"
+                "    PDFs under ~200KB."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "fields_json": {
+                        "type": "string",
+                        "description": (
+                            "PREFERRED. JSON array of field objects extracted locally. "
+                            "Each object: {\"name\": str, \"type\": str, \"page\": int, "
+                            "\"bbox\": [x0, y0, x1, y1]}. "
+                            "Run the python snippet in the tool description to produce this."
+                        ),
+                    },
                     "file_path": {
                         "type": "string",
                         "description": (
-                            "Absolute path to the PDF file. PREFERRED over pdf_base64. "
-                            "On claude.ai, uploaded files live at "
-                            "/mnt/user-data/uploads/<filename>."
+                            "Absolute path to the PDF. Only works if the server can access "
+                            "the path (local server). On Vercel (remote) this will fail."
                         ),
                     },
                     "pdf_base64": {
                         "type": "string",
                         "description": (
-                            "Base64-encoded PDF bytes. Fallback only — use file_path "
-                            "whenever possible to avoid filling the context window."
+                            "Base64-encoded PDF bytes. Last resort — causes context overflow "
+                            "for PDFs over ~200KB. Do NOT produce this via bash."
                         ),
                     },
                     "annotate_pages": {
                         "type": "boolean",
                         "description": (
                             "Default false. Set true to also receive annotated JPEG page "
-                            "images in the response. Only useful when nearby_text labels "
-                            "are insufficient. Avoid for PDFs > 3 pages."
+                            "images alongside the JSON. Avoid for PDFs > 3 pages."
                         ),
                         "default": False,
                     },
@@ -167,25 +190,85 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 # ---------------------------------------------------------------------------
 
 async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    fields_json_str = args.get("fields_json") or ""
     file_path = args.get("file_path") or ""
     pdf_b64 = args.get("pdf_base64") or ""
     annotate_pages = bool(args.get("annotate_pages", False))
 
-    if not file_path and not pdf_b64:
+    if not fields_json_str and not file_path and not pdf_b64:
         return [TextContent(type="text", text=(
-            "ERROR: provide file_path or pdf_base64.\n"
-            "PREFERRED: file_path (e.g. /mnt/user-data/uploads/form.pdf) — zero context cost.\n"
-            "Do NOT base64-encode the file in bash first; pass the path directly."
+            "ERROR: provide fields_json, file_path, or pdf_base64.\n"
+            "BEST OPTION: run the python snippet from the tool description locally "
+            "to extract field data, then pass the output as fields_json. "
+            "This sends only ~5KB instead of the whole PDF."
         ))]
 
-    # --- Resolve PDF to a local path ---
+    # -----------------------------------------------------------------------
+    # MODE 1: pre-extracted fields_json — no PDF needed on server
+    # -----------------------------------------------------------------------
+    if fields_json_str:
+        try:
+            raw_fields: list[dict[str, Any]] = json.loads(fields_json_str)
+        except json.JSONDecodeError as exc:
+            return [TextContent(type="text", text=f"ERROR parsing fields_json: {exc}")]
+
+        if not raw_fields:
+            return [TextContent(type="text", text=(
+                "No fields found in fields_json. "
+                "Make sure the PDF has interactive AcroForm fields and the "
+                "extraction script ran correctly."
+            ))]
+
+        # Build FieldWidget-like objects to feed the alias registry
+        from fillform.structure import FieldWidget
+        widgets = []
+        for f in raw_fields:
+            bbox = f.get("bbox") or [0, 0, 100, 20]
+            widgets.append(FieldWidget(
+                name=str(f.get("name") or "unknown"),
+                field_type=str(f.get("type") or "Tx"),
+                page=int(f.get("page") or 0),
+                bbox=(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+            ))
+
+        alias_map = _alias_registry.assign(widgets)
+
+        fields_data: list[dict[str, Any]] = []
+        for alias, widget in alias_map.field_widgets.items():
+            position = _position_hint_raw(widget.bbox, widget.page)
+            fields_data.append({
+                "alias": alias,
+                "name": widget.name,
+                "type": widget.field_type,
+                "page": widget.page + 1,
+                "bbox": [round(v, 1) for v in widget.bbox],
+                "position": position,
+            })
+        fields_data.sort(key=lambda f: f["alias"])
+
+        result: dict[str, Any] = {
+            "field_count": len(fields_data),
+            "alias_map": alias_map.alias_to_field,
+            "fields": fields_data,
+            "instructions": (
+                "Use the original PDF attachment in your conversation to identify what "
+                "each field collects. Match fields by their 'position' and 'name'. "
+                "Once all fields are identified, call save_field_mapping."
+            ),
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    # -----------------------------------------------------------------------
+    # MODE 2/3: resolve PDF from file_path or pdf_base64
+    # -----------------------------------------------------------------------
     if file_path:
         fp = Path(file_path).expanduser()
         if not fp.exists():
             return [TextContent(type="text", text=(
                 f"ERROR: file not found at '{file_path}'.\n"
-                "On claude.ai, uploaded files are at /mnt/user-data/uploads/<filename>.\n"
-                "Check the exact filename and try again."
+                "This server cannot access local files on your machine. "
+                "Use fields_json instead: run the python snippet from the tool "
+                "description to extract field data locally, then pass the output here."
             ))]
         pdf_tmp = fp
         _own_tmp = False
@@ -199,7 +282,6 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
             pdf_tmp = Path(f.name)
         _own_tmp = True
 
-    # --- Extract structure ---
     try:
         structure = _structure_service.extract(pdf_tmp)
     except Exception as exc:
@@ -212,52 +294,43 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
             pdf_tmp.unlink(missing_ok=True)
         return [TextContent(type="text", text=(
             "No AcroForm fields found. "
-            "This tool requires a PDF with interactive AcroForm fields. "
-            "Scanned or image-only PDFs are not supported."
+            "This tool requires a PDF with interactive AcroForm fields."
         ))]
 
-    # --- Assign aliases ---
     alias_map = _alias_registry.assign(structure.field_widgets)
 
-    # --- Build per-field metadata with nearby text labels ---
-    fields_data: list[dict[str, Any]] = []
+    fields_data2: list[dict[str, Any]] = []
     for alias, widget in alias_map.field_widgets.items():
         nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
         page_dim = next(
             (pd for pd in structure.page_dimensions if pd.page == widget.page), None
         )
         position = _position_hint(widget.bbox, widget.page, page_dim)
-        fields_data.append({
+        fields_data2.append({
             "alias": alias,
             "name": widget.name,
             "type": widget.field_type,
-            "page": widget.page + 1,  # 1-based for human readability
+            "page": widget.page + 1,
             "bbox": [round(v, 1) for v in widget.bbox],
             "position": position,
             "nearby_text": nearby,
         })
+    fields_data2.sort(key=lambda f: f["alias"])
 
-    # Sort by alias for deterministic output
-    fields_data.sort(key=lambda f: f["alias"])
-
-    result: dict[str, Any] = {
-        "field_count": len(fields_data),
+    result2: dict[str, Any] = {
+        "field_count": len(fields_data2),
         "page_count": len(structure.page_dimensions),
         "alias_map": alias_map.alias_to_field,
-        "fields": fields_data,
+        "fields": fields_data2,
         "instructions": (
-            "Review the 'nearby_text' and 'position' for each field to identify what it "
-            "collects. The original PDF attachment in your conversation shows the form — "
-            "use it to verify any fields where nearby_text is unclear. "
-            "Once you have identified all fields, call save_field_mapping with your analysis."
+            "Review 'nearby_text' and 'position' to identify each field. "
+            "Once all fields are identified, call save_field_mapping."
         ),
     }
-
     content: list[TextContent | ImageContent] = [
-        TextContent(type="text", text=json.dumps(result, indent=2))
+        TextContent(type="text", text=json.dumps(result2, indent=2))
     ]
 
-    # --- Optional annotated pages (escape hatch) ---
     if annotate_pages:
         annotated_tmp = Path(tempfile.mktemp(suffix="_annotated.pdf", dir="/tmp"))
         try:
@@ -274,7 +347,6 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
 
     if _own_tmp:
         pdf_tmp.unlink(missing_ok=True)
-
     return content
 
 
@@ -393,10 +465,23 @@ def _position_hint(
 ) -> str:
     """Return a human-readable position string like 'page 2, upper-left'."""
     if page_dim is None:
-        return f"page {page + 1}"
+        return _position_hint_raw(bbox, page)
     cx = (bbox[0] + bbox[2]) / 2 / page_dim.width
-    # fitz coords: y=0 is top of page, y increases downward
     cy = (bbox[1] + bbox[3]) / 2 / page_dim.height
+    horiz = "left" if cx < 0.4 else ("right" if cx > 0.6 else "center")
+    vert = "upper" if cy < 0.33 else ("lower" if cy > 0.66 else "middle")
+    return f"page {page + 1}, {vert}-{horiz}"
+
+
+def _position_hint_raw(
+    bbox: tuple[float, float, float, float],
+    page: int,
+    page_width: float = 612.0,
+    page_height: float = 792.0,
+) -> str:
+    """Position hint without page dimensions — uses US Letter defaults."""
+    cx = (bbox[0] + bbox[2]) / 2 / page_width
+    cy = (bbox[1] + bbox[3]) / 2 / page_height
     horiz = "left" if cx < 0.4 else ("right" if cx > 0.6 else "center")
     vert = "upper" if cy < 0.33 else ("lower" if cy > 0.66 else "middle")
     return f"page {page + 1}, {vert}-{horiz}"

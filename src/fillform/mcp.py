@@ -80,6 +80,7 @@ import base64
 import json
 import math
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -123,6 +124,7 @@ def _make_structure_service() -> PdfStructureService:
 _structure_service = _make_structure_service()
 _alias_registry = FieldAliasRegistry()
 _annotator = PdfAnnotator()
+_analysis_sessions: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------

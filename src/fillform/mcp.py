@@ -121,6 +121,25 @@ _annotator = PdfAnnotator()
 _analysis_sessions: dict[str, dict[str, Any]] = {}
 
 
+PDF_BYTES_DESCRIPTION = (
+    "Optional base64-encoded PDF bytes. Use this when file-path rewriting is "
+    "unavailable in proxied mount environments."
+)
+
+
+def _pdf_source_properties(path_description: str) -> dict[str, Any]:
+    return {
+        "pdf_path": {
+            "type": "string",
+            "description": path_description,
+        },
+        "pdf_bytes_base64": {
+            "type": "string",
+            "description": PDF_BYTES_DESCRIPTION,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
@@ -148,14 +167,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to the PDF file.",
-                    },
-                    "pdf_bytes_base64": {
-                        "type": "string",
-                        "description": "Optional base64-encoded PDF bytes. Use this when file-path rewriting is unavailable in proxied mount environments.",
-                    },
+                    **_pdf_source_properties("Absolute or relative path to the PDF file."),
                     "annotate_pages": {
                         "type": "boolean",
                         "description": "Default false. Set true to attach annotated page images.",
@@ -183,14 +195,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to the PDF file.",
-                    },
-                    "pdf_bytes_base64": {
-                        "type": "string",
-                        "description": "Optional base64-encoded PDF bytes.",
-                    },
+                    **_pdf_source_properties("Absolute or relative path to the PDF file."),
                     "annotate_pages": {
                         "type": "boolean",
                         "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
@@ -295,14 +300,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to source PDF.",
-                    },
-                    "pdf_bytes_base64": {
-                        "type": "string",
-                        "description": "Optional base64-encoded PDF bytes.",
-                    },
+                    **_pdf_source_properties("Absolute or relative path to source PDF."),
                     "values_json": {
                         "description": (
                             "Field values to apply. Accepts either a JSON string or an object. "
@@ -347,14 +345,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to source PDF.",
-                    },
-                    "pdf_bytes_base64": {
-                        "type": "string",
-                        "description": "Optional base64-encoded PDF bytes.",
-                    },
+                    **_pdf_source_properties("Absolute or relative path to source PDF."),
                     "mode": {
                         "type": "string",
                         "description": "Either 'user_data' (default) or 'demo'.",
@@ -389,8 +380,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {"type": "string"},
-                    "pdf_bytes_base64": {"type": "string"},
+                    **_pdf_source_properties("Absolute or relative path to source PDF."),
                     "semantic_data_json": {
                         "oneOf": [{"type": "string"}, {"type": "object"}],
                         "description": "Semantic key/value payload.",
@@ -409,8 +399,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {"type": "string"},
-                    "pdf_bytes_base64": {"type": "string"},
+                    **_pdf_source_properties("Absolute or relative path to source PDF."),
                     "expected_min_fill_ratio": {
                         "type": "number",
                         "default": 0.6,

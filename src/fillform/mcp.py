@@ -96,6 +96,13 @@ from mcp.types import (
 from .annotator import PdfAnnotator
 from .contracts import CanonicalField, CanonicalSchema
 from .field_alias import AliasMap, FieldAliasRegistry
+from .mcp_support import (
+    PDF_BYTES_DESCRIPTION,
+    create_session,
+    get_session,
+    pdf_source_properties,
+    resolve_pdf_source,
+)
 from .structure import PdfStructureService, TextBlock
 
 # ---------------------------------------------------------------------------
@@ -147,10 +154,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to the PDF file.",
-                    },
+                    **pdf_source_properties("Absolute or relative path to the PDF file."),
                     "annotate_pages": {
                         "type": "boolean",
                         "description": "Default false. Set true to attach annotated page images.",
@@ -174,6 +178,30 @@ async def list_tools() -> list[Tool]:
                 "The response is JSON-only by default — no images — keeping context usage minimal. "
                 "Set annotate_pages=true to also receive annotated page images when "
                 "nearby_text labels are insufficient to identify fields."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to the PDF file."),
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
+                    "persist_session": {
+                        "type": "boolean",
+                        "description": "Default true. Persist alias map/pdf path in server memory and return a session_id for follow-up calls.",
+                        "default": True,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
             ),
             inputSchema={
                 "type": "object",
@@ -308,10 +336,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to source PDF.",
-                    },
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "values_json": {
                         "description": (
                             "Field values to apply. Accepts either a JSON string or an object. "
@@ -344,7 +369,7 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["pdf_path", "values_json"],
+                "required": ["values_json"],
             },
         ),
         Tool(
@@ -356,10 +381,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {
-                        "type": "string",
-                        "description": "Absolute or relative path to source PDF.",
-                    },
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "mode": {
                         "type": "string",
                         "description": "Either 'user_data' (default) or 'demo'.",
@@ -382,7 +404,7 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
-                "required": ["pdf_path"],
+                "required": [],
             },
         ),
         Tool(
@@ -394,14 +416,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {"type": "string"},
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "semantic_data_json": {
                         "oneOf": [{"type": "string"}, {"type": "object"}],
                         "description": "Semantic key/value payload.",
                     },
                     "output_pdf_path": {"type": "string"},
                 },
-                "required": ["pdf_path", "semantic_data_json"],
+                "required": ["semantic_data_json"],
             },
         ),
         Tool(
@@ -413,14 +435,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {"type": "string"},
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
                     "expected_min_fill_ratio": {
                         "type": "number",
                         "default": 0.6,
                         "description": "Warn if less than this ratio of fields appear populated.",
                     },
                 },
-                "required": ["pdf_path"],
+                "required": [],
             },
         ),
     ]
@@ -454,7 +476,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
 
 async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    pdf_path = Path(args["pdf_path"]).expanduser().resolve()
+    try:
+        pdf_path = resolve_pdf_source(args)
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     annotate_pages = bool(args.get("annotate_pages", False))
 
     if not pdf_path.exists():
@@ -526,7 +551,7 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
         },
     }
     if bool(args.get("persist_session", True)):
-        session_id = _create_session(
+        session_id = create_session(
             pdf_path=pdf_path,
             alias_map=alias_map.alias_to_field,
         )
@@ -557,7 +582,10 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
 
 
 async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    pdf_path = Path(args["pdf_path"]).expanduser().resolve()
+    try:
+        pdf_path = resolve_pdf_source(args)
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     annotate_pages = bool(args.get("annotate_pages", False))
     threshold_raw = args.get("ambiguity_threshold", 0.72)
     try:
@@ -632,7 +660,7 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
         },
     }
     if bool(args.get("persist_session", True)):
-        session_id = _create_session(pdf_path=pdf_path, alias_map=alias_map.alias_to_field)
+        session_id = create_session(pdf_path=pdf_path, alias_map=alias_map.alias_to_field)
         result["session_id"] = session_id
         result["session_expires_note"] = "In-memory session, valid while this MCP process is alive."
 
@@ -656,7 +684,7 @@ async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent
 
 
 async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
+    session = get_session(args.get("session_id"))
     pdf_path_str = args.get("pdf_path") or (session.get("pdf_path") if session else "")
     form_family = str(args.get("form_family") or "unknown")
     version = str(args.get("version") or "1")
@@ -740,8 +768,11 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
-    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
+    session = get_session(args.get("session_id"))
+    try:
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
 
@@ -797,8 +828,11 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
-    session = _get_session(args.get("session_id"))
-    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
+    session = get_session(args.get("session_id"))
+    try:
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
 
@@ -880,8 +914,11 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
 
 
 async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
-    session = _get_session(args.get("session_id"))
-    pdf_path = Path(str(args.get("pdf_path") or (session.get("pdf_path") if session else ""))).expanduser().resolve()
+    session = get_session(args.get("session_id"))
+    try:
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
     output_pdf_path = Path(
@@ -919,7 +956,10 @@ async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
-    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    try:
+        pdf_path = resolve_pdf_source(args)
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
     expected_min_fill_ratio = float(args.get("expected_min_fill_ratio", 0.6))
@@ -982,12 +1022,14 @@ def _workflow_guide() -> list[TextContent]:
         "templates": {
             "analyze_form": {
                 "pdf_path": "/path/to/form.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "annotate_pages": True,
                 "ambiguity_threshold": 0.72,
                 "persist_session": True,
             },
             "extract_form_fields": {
                 "pdf_path": "/path/to/form.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "annotate_pages": True,
             },
             "save_field_mapping": {
@@ -1001,6 +1043,7 @@ def _workflow_guide() -> list[TextContent]:
             "fill_pdf_form": {
                 "session_id": "<preferred>",
                 "pdf_path": "/path/to/form.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "values_json": "{\"F001\":\"Alice Example\"}",
                 "alias_map_json": "{\"F001\":\"field.name\"}",
                 "output_pdf_path": "/optional/path/filled.pdf",
@@ -1008,12 +1051,14 @@ def _workflow_guide() -> list[TextContent]:
             "complete_form": {
                 "session_id": "<optional>",
                 "pdf_path": "/path/to/form.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "mode": "demo",
                 "preview_pages": True,
             },
             "fill_form": {
                 "session_id": "<optional>",
                 "pdf_path": "/path/to/form.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "semantic_data_json": {
                     "full_name": "Jordan Demo",
                     "date": "03/26/2026",
@@ -1022,11 +1067,13 @@ def _workflow_guide() -> list[TextContent]:
             },
             "validate_form": {
                 "pdf_path": "/path/to/filled.pdf",
+                "pdf_bytes_base64": "<optional base64 bytes>",
                 "expected_min_fill_ratio": 0.6,
             },
         },
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
+            "If proxied mount path rewriting fails, pass pdf_bytes_base64 instead of pdf_path.",
             "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
@@ -1189,26 +1236,6 @@ def _map_semantic_data_to_aliases(
 def _tokenize(text: str) -> list[str]:
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
     return [tok for tok in cleaned.split() if tok]
-
-
-def _create_session(pdf_path: Path, alias_map: dict[str, str]) -> str:
-    session_id = str(uuid.uuid4())
-    _analysis_sessions[session_id] = {
-        "pdf_path": str(pdf_path),
-        "alias_map": dict(alias_map),
-    }
-    # Avoid unbounded growth in long-lived processes.
-    if len(_analysis_sessions) > 100:
-        for key in list(_analysis_sessions.keys())[:20]:
-            _analysis_sessions.pop(key, None)
-    return session_id
-
-
-def _get_session(session_id: Any) -> dict[str, Any] | None:
-    if not session_id:
-        return None
-    sid = str(session_id)
-    return _analysis_sessions.get(sid)
 
 
 # ---------------------------------------------------------------------------

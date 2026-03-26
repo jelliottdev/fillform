@@ -419,6 +419,22 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="fill_with_demo_data",
+            description=(
+                "Simplest endpoint for agents: fill a PDF with coherent demo data in one call "
+                "and return quality/validation details."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute or relative path to source PDF."),
+                    "output_pdf_path": {"type": "string"},
+                    "preview_pages": {"type": "boolean", "default": False},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="fill_form",
             description=(
                 "Fill using semantic keys (for example 'full_name', 'filing_status'). "
@@ -512,6 +528,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         one_shot_args.setdefault("strict_validation", True)
         one_shot_args.setdefault("auto_fix_logic", True)
         return await _complete_form(one_shot_args)
+    if name == "fill_with_demo_data":
+        demo_args = dict(arguments)
+        demo_args["mode"] = "demo"
+        demo_args.setdefault("strict_validation", True)
+        demo_args.setdefault("auto_fix_logic", True)
+        return await _complete_form(demo_args)
     if name == "fill_form":
         return await _fill_form(arguments)
     if name == "validate_form":
@@ -911,18 +933,13 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         except ValueError as exc:
             return [TextContent(type="text", text=f"ERROR: {exc}")]
 
-    analyzed_rows: list[dict[str, Any]] = []
     generated_demo_values: dict[str, str] = {}
-    for alias, widget in sorted(alias_map.field_widgets.items()):
-        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
-        label_guess, confidence, _ = _guess_semantics(
-            field_name=widget.name,
-            nearby_text=nearby,
-            field_type=widget.field_type,
+    if mode == "demo":
+        generated_demo_values = _build_demo_values(
+            alias_map=alias_map,
+            structure=structure,
+            provided_values=provided_values,
         )
-        analyzed_rows.append({"alias": alias, "field_name": widget.name, "label_guess": label_guess, "confidence": confidence})
-        if mode == "demo" and alias not in provided_values and widget.name not in provided_values:
-            generated_demo_values[alias] = _demo_value_for_field(label_guess, widget.field_type)
 
     fill_values = dict(generated_demo_values)
     fill_values.update(provided_values)
@@ -1124,7 +1141,7 @@ def _workflow_guide() -> list[TextContent]:
     payload = {
         "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
         "recommended_tool_order": [
-            "one_shot_fill_form (or: complete_form / map_fill_validate)",
+            "fill_with_demo_data (demo) or one_shot_fill_form (general)",
         ],
         "tool_aliases": {
             "prepare_form_for_analysis": "extract_form_fields",
@@ -1173,6 +1190,10 @@ def _workflow_guide() -> list[TextContent]:
                 "mode": "demo",
                 "preview_pages": True,
             },
+            "fill_with_demo_data": {
+                "pdf_path": "/path/to/form.pdf",
+                "preview_pages": True,
+            },
             "fill_form": {
                 "session_id": "<optional>",
                 "pdf_path": "/path/to/form.pdf",
@@ -1201,7 +1222,8 @@ def _workflow_guide() -> list[TextContent]:
             "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
-            "Use one_shot_fill_form for the fastest end-to-end path (analyze + fill + validate + auto-fix).",
+            "Use fill_with_demo_data for the fastest demo-only path.",
+            "Use one_shot_fill_form for the fastest configurable end-to-end path (analyze + fill + validate + auto-fix).",
             "Use complete_form for a configurable single-call pipeline with strict_validation and auto_fix_logic.",
             "Use fill_form if you only have semantic keys and want auto-mapping.",
             "annotate_pages=true returns annotated images directly; no separate local annotation script is required.",
@@ -1589,6 +1611,111 @@ def _selected_yes_no_from_widgets(widgets: list[Any]) -> str | None:
                 return "yes"
             return "yes"
     return None
+
+
+def _build_demo_values(
+    alias_map: AliasMap,
+    structure: Any,
+    provided_values: dict[str, Any],
+) -> dict[str, str]:
+    schedule_j_payload = _schedule_j_demo_field_values(structure)
+    widget_by_name = {w.name: w for w in structure.field_widgets}
+    values: dict[str, str] = {}
+    for alias, field_name in sorted(alias_map.alias_to_field.items()):
+        if alias in provided_values or field_name in provided_values:
+            continue
+        if field_name in schedule_j_payload:
+            values[alias] = schedule_j_payload[field_name]
+            continue
+        widget = widget_by_name.get(field_name)
+        if widget is None:
+            continue
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        label_guess, _, _ = _guess_semantics(
+            field_name=widget.name,
+            nearby_text=nearby,
+            field_type=widget.field_type,
+        )
+        values[alias] = _demo_value_for_field(label_guess, widget.field_type)
+    return values
+
+
+def _schedule_j_demo_field_values(structure: Any) -> dict[str, str]:
+    field_names = {str(w.name) for w in getattr(structure, "field_widgets", [])}
+    required = {"22a", "22c", "23a", "23b", "23c", "check24", "Other 24"}
+    if not required.issubset(field_names):
+        return {}
+
+    payload: dict[str, str] = {
+        "Debtor 1": "Alex Parker",
+        "Debtor 2": "Jamie Parker",
+        "Case number": "26-12458",
+        "Bankruptcy District Information": "Northern District of California",
+        "check1": "yes",
+        "check1a": "no",
+        "check2": "yes",
+        "check2a": "yes",
+        "check2b": "yes",
+        "check2c": "no",
+        "check2d": "no",
+        "check2e": "no",
+        "check3": "no",
+        "Dependant Relation 2a": "Child",
+        "Dependant age 2a": "11",
+        "Dependant Relation 2b": "Child",
+        "Dependant age 2b": "8",
+        "4": "2400",
+        "4a": "260",
+        "4b": "90",
+        "4c": "140",
+        "4d": "65",
+        "5": "0",
+        "6a": "180",
+        "6b": "85",
+        "6c": "210",
+        "Other 6d": "Streaming services",
+        "6d": "35",
+        "7": "920",
+        "8": "430",
+        "9": "130",
+        "10": "95",
+        "11": "165",
+        "12": "310",
+        "13": "95",
+        "14": "85",
+        "15a": "25",
+        "15b": "460",
+        "15c": "145",
+        "Other 15d": "Umbrella policy",
+        "15d": "20",
+        "Other 16": "Local personal property tax",
+        "16": "40",
+        "17a": "430",
+        "17b": "370",
+        "Other 17c": "Furniture financing",
+        "17c": "60",
+        "Other 17d": "Appliance lease",
+        "17d": "45",
+        "18": "0",
+        "Other 19": "",
+        "19": "0",
+        "20a": "0",
+        "20b": "0",
+        "20c": "0",
+        "20d": "0",
+        "20e": "0",
+        "Other 21": "Pet care",
+        "21": "85",
+        "22a": "6625",
+        "22b": "0",
+        "22c": "6625",
+        "23a": "7010",
+        "23b": "6625",
+        "23c": "385",
+        "check24": "yes",
+        "Other 24": "Vehicle loan payoff expected within 10 months, reducing expenses by about $370 monthly.",
+    }
+    return {k: v for k, v in payload.items() if k in field_names}
 
 
 def _auto_fix_logic_issues(pdf_path: Path) -> dict[str, Any]:

@@ -174,7 +174,7 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent]:
-    if name == "extract_form_fields":
+    if name in ("extract_form_fields", "prepare_form_for_analysis"):  # backward compat
         return await _extract_fields(arguments)
     if name == "save_field_mapping":
         return await _save_mapping(arguments)

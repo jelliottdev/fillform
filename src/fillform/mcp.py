@@ -7,7 +7,14 @@ and performs the vision analysis in its own context.
 
 Tools
 -----
-prepare_form_for_analysis
+fillform_workflow_guide
+    Returns a compact quickstart and tool-call templates for agents.
+
+analyze_form
+    One-shot form understanding: extracts fields, guesses semantic labels,
+    returns confidence scores, and highlights ambiguous fields.
+
+extract_form_fields
     Extract AcroForm fields, assign FXXX aliases, render annotated pages, and
     return the alias map JSON + one PNG image per page.  Claude reads the images
     and identifies what each labeled field is for.
@@ -16,6 +23,12 @@ save_field_mapping
     Accepts Claude's field analysis (as JSON), combines it with the alias map,
     builds a :class:`~fillform.contracts.CanonicalSchema`, persists the schema
     and a plain-text fill script, and returns the fill script text.
+
+prepare_form_for_analysis
+    Backward-compatible alias for ``extract_form_fields``.
+
+fill_pdf_form
+    Fill a PDF with user-provided values keyed by FXXX alias or raw field name.
 
 Usage
 -----
@@ -102,6 +115,44 @@ _annotator = PdfAnnotator()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
+            name="fillform_workflow_guide",
+            description=(
+                "Start here for FillForm usage. Returns the recommended tool order "
+                "and copy/paste-ready payload templates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="analyze_form",
+            description=(
+                "One-shot semantic analysis for an AcroForm PDF. Returns field-level "
+                "label guesses, confidence scores, section hints, and an ambiguity list."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to attach annotated page images.",
+                        "default": False,
+                    },
+                    "ambiguity_threshold": {
+                        "type": "number",
+                        "description": "Confidence below this value is flagged as ambiguous (0..1). Default 0.72.",
+                        "default": 0.72,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
+        Tool(
             name="extract_form_fields",
             description=(
                 "Extract AcroForm fields from a PDF, assign sequential FXXX aliases "
@@ -110,6 +161,28 @@ async def list_tools() -> list[Tool]:
                 "The response is JSON-only by default — no images — keeping context usage minimal. "
                 "Set annotate_pages=true to also receive annotated page images when "
                 "nearby_text labels are insufficient to identify fields."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
+        Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
             ),
             inputSchema={
                 "type": "object",
@@ -142,21 +215,24 @@ async def list_tools() -> list[Tool]:
                         "description": "Path to the original PDF (used to derive default output paths).",
                     },
                     "alias_map_json": {
-                        "type": "string",
                         "description": (
-                            "The alias map JSON string returned by prepare_form_for_analysis "
-                            "(the 'alias_map' key from that response)."
+                            "Alias map from extract_form_fields. Accepts either a JSON string "
+                            "or an object with alias→field-name entries."
                         ),
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object"},
+                        ],
                     },
                     "field_analysis_json": {
-                        "type": "string",
                         "description": (
                             "JSON object mapping each FXXX alias to its semantic description. "
-                            "Structure: { \"F001\": { \"label\": \"…\", \"context\": \"…\", "
-                            "\"expected_value_type\": \"string|date|number|boolean|signature|selection\", "
-                            "\"expected_format\": \"…or null\", \"is_required\": true|false, "
-                            "\"section\": \"…or null\" }, … }"
+                            "Accepts either a JSON string or an object."
                         ),
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object"},
+                        ],
                     },
                     "form_family": {
                         "type": "string",
@@ -176,7 +252,51 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["pdf_path", "alias_map_json", "field_analysis_json"],
+                "required": ["alias_map_json", "field_analysis_json"],
+            },
+        ),
+        Tool(
+            name="fill_pdf_form",
+            description=(
+                "Fill an AcroForm PDF using user-provided values keyed by either FXXX alias "
+                "or raw PDF field names. Returns the output PDF path and a per-field fill log."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to source PDF.",
+                    },
+                    "values_json": {
+                        "description": (
+                            "Field values to apply. Accepts either a JSON string or an object. "
+                            "Keys may be FXXX aliases or raw PDF field names."
+                        ),
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object"},
+                        ],
+                    },
+                    "alias_map_json": {
+                        "description": (
+                            "Optional alias map from extract_form_fields (JSON string or object). "
+                            "Required when values_json uses FXXX aliases."
+                        ),
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object"},
+                        ],
+                    },
+                    "output_pdf_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional output path. Defaults to <input_stem>_filled.pdf "
+                            "next to the source PDF."
+                        ),
+                    },
+                },
+                "required": ["pdf_path", "values_json"],
             },
         ),
     ]
@@ -188,10 +308,18 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent]:
+    if name == "fillform_workflow_guide":
+        return _workflow_guide()
+    if name == "analyze_form":
+        return await _analyze_form(arguments)
     if name == "extract_form_fields":
+        return await _extract_fields(arguments)
+    if name == "prepare_form_for_analysis":
         return await _extract_fields(arguments)
     if name == "save_field_mapping":
         return await _save_mapping(arguments)
+    if name == "fill_pdf_form":
+        return await _fill_pdf_form(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -236,14 +364,34 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
     fields_data.sort(key=lambda f: f["alias"])
 
     result: dict[str, Any] = {
+        "recommended_tool_order": [
+            "fillform_workflow_guide",
+            "extract_form_fields (or prepare_form_for_analysis)",
+            "save_field_mapping",
+            "fill_pdf_form",
+        ],
         "field_count": len(fields_data),
         "page_count": len(structure.page_dimensions),
         "alias_map": alias_map.alias_to_field,
+        "alias_map_json": json.dumps(alias_map.alias_to_field),
         "fields": fields_data,
         "instructions": (
             "Review the 'nearby_text' and 'position' for each field to identify what it collects. "
             "Once all fields are identified, call save_field_mapping with your analysis."
         ),
+        "next_call_templates": {
+            "save_field_mapping": {
+                "alias_map_json": "<paste alias_map_json>",
+                "field_analysis_json": "{\"F001\": {\"label\": \"...\", \"context\": \"...\", \"expected_value_type\": \"string\", \"expected_format\": null, \"is_required\": false, \"section\": null}}",
+                "form_family": "unknown",
+                "version": "1",
+            },
+            "fill_pdf_form": {
+                "pdf_path": str(pdf_path),
+                "values_json": "{\"F001\": \"value\"}",
+                "alias_map_json": "<paste alias_map_json when using FXXX keys>",
+            },
+        },
     }
 
     content: list[TextContent | ImageContent] = [
@@ -269,6 +417,101 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
     return content
 
 
+async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    pdf_path = Path(args["pdf_path"]).expanduser().resolve()
+    annotate_pages = bool(args.get("annotate_pages", False))
+    threshold_raw = args.get("ambiguity_threshold", 0.72)
+    try:
+        ambiguity_threshold = float(threshold_raw)
+    except (TypeError, ValueError):
+        ambiguity_threshold = 0.72
+    ambiguity_threshold = max(0.0, min(1.0, ambiguity_threshold))
+
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    try:
+        structure = _structure_service.extract(pdf_path)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
+
+    if not structure.field_widgets:
+        return [TextContent(type="text", text=(
+            f"No AcroForm fields found in '{pdf_path.name}'. "
+            "This pipeline requires a PDF with interactive AcroForm fields."
+        ))]
+
+    alias_map = _alias_registry.assign(structure.field_widgets)
+    analysis_fields: list[dict[str, Any]] = []
+    ambiguous_fields: list[dict[str, Any]] = []
+
+    for alias, widget in sorted(alias_map.field_widgets.items()):
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        page_dim = next((pd for pd in structure.page_dimensions if pd.page == widget.page), None)
+        section_hint = _section_hint(widget.page, widget.bbox, structure.text_blocks)
+        label_guess, confidence, rationale = _guess_semantics(
+            field_name=widget.name,
+            nearby_text=nearby,
+            field_type=widget.field_type,
+        )
+        entry = {
+            "alias": alias,
+            "field_name": widget.name,
+            "field_type": widget.field_type,
+            "page": widget.page + 1,
+            "bbox": [round(v, 1) for v in widget.bbox],
+            "position": _position_hint(widget.bbox, widget.page, page_dim),
+            "label_guess": label_guess,
+            "section_hint": section_hint,
+            "confidence": round(confidence, 3),
+            "rationale": rationale,
+            "nearby_text": nearby,
+        }
+        analysis_fields.append(entry)
+        if confidence < ambiguity_threshold:
+            ambiguous_fields.append(
+                {
+                    "alias": alias,
+                    "confidence": round(confidence, 3),
+                    "label_guess": label_guess,
+                    "suggested_review": "Confirm this field manually from the annotated page image.",
+                }
+            )
+
+    result: dict[str, Any] = {
+        "pdf_path": str(pdf_path),
+        "field_count": len(analysis_fields),
+        "alias_map": alias_map.alias_to_field,
+        "alias_map_json": json.dumps(alias_map.alias_to_field),
+        "ambiguity_threshold": ambiguity_threshold,
+        "ambiguous_count": len(ambiguous_fields),
+        "ambiguous_fields": ambiguous_fields,
+        "fields": analysis_fields,
+        "next_actions": {
+            "save_field_mapping": "Use alias_map_json + your verified field analysis.",
+            "fill_pdf_form": "After collecting user data, pass values_json and alias_map_json.",
+        },
+    }
+
+    content: list[TextContent | ImageContent] = [
+        TextContent(type="text", text=json.dumps(result, indent=2))
+    ]
+    if annotate_pages:
+        tmp = tempfile.NamedTemporaryFile(suffix="_annotated.pdf", delete=False)
+        tmp.close()
+        annotated_path = Path(tmp.name)
+        try:
+            _annotator.annotate(pdf_path, alias_map, annotated_path)
+            for i, img_b64 in enumerate(_render_pages(annotated_path), start=1):
+                content.append(TextContent(type="text", text=f"--- Analyze Form Page {i} ---"))
+                content.append(ImageContent(type="image", data=img_b64, mimeType="image/jpeg"))
+        except Exception as exc:
+            content.append(TextContent(type="text", text=f"WARNING: annotation failed: {exc}"))
+        finally:
+            annotated_path.unlink(missing_ok=True)
+    return content
+
+
 async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
     pdf_path_str = args.get("pdf_path") or ""
     form_family = str(args.get("form_family") or "unknown")
@@ -282,15 +525,15 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 
     # Parse alias map
     try:
-        alias_map_raw: dict[str, Any] = json.loads(args["alias_map_json"])
-    except json.JSONDecodeError as exc:
-        return [TextContent(type="text", text=f"ERROR parsing alias_map_json: {exc}")]
+        alias_map_raw = _coerce_json_object(args.get("alias_map_json"), "alias_map_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
 
     # Parse field analysis
     try:
-        field_analysis: dict[str, dict[str, Any]] = json.loads(args["field_analysis_json"])
-    except json.JSONDecodeError as exc:
-        return [TextContent(type="text", text=f"ERROR parsing field_analysis_json: {exc}")]
+        field_analysis = _coerce_json_object(args.get("field_analysis_json"), "field_analysis_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
 
     # Accept both flat {alias→name} and nested {alias_index: {alias→name}} formats
     if "alias_index" in alias_map_raw:
@@ -346,6 +589,191 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
             ),
         )
     ]
+
+
+async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
+    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    output_pdf_path = Path(
+        str(args.get("output_pdf_path") or (pdf_path.parent / f"{pdf_path.stem}_filled.pdf"))
+    ).expanduser().resolve()
+
+    try:
+        values = _coerce_json_object(args.get("values_json"), "values_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    alias_map: dict[str, str] = {}
+    if args.get("alias_map_json") is not None:
+        try:
+            alias_map_raw = _coerce_json_object(args.get("alias_map_json"), "alias_map_json")
+            if "alias_index" in alias_map_raw and isinstance(alias_map_raw["alias_index"], dict):
+                alias_map = {str(k): str(v) for k, v in alias_map_raw["alias_index"].items()}
+            else:
+                alias_map = {str(k): str(v) for k, v in alias_map_raw.items()}
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    try:
+        import fitz
+    except ImportError as exc:
+        return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
+
+    fill_log: dict[str, str] = {}
+    with fitz.open(str(pdf_path)) as doc:
+        widgets_by_name: dict[str, Any] = {}
+        for page in doc:
+            for widget in page.widgets() or []:
+                if widget.field_name:
+                    widgets_by_name[str(widget.field_name)] = widget
+
+        for key, raw_value in values.items():
+            key_str = str(key)
+            field_name = alias_map.get(key_str, key_str)
+            widget = widgets_by_name.get(field_name)
+            if widget is None:
+                fill_log[key_str] = f"missing_field:{field_name}"
+                continue
+
+            value = "" if raw_value is None else str(raw_value)
+            try:
+                widget.field_value = value
+                widget.update()
+                fill_log[key_str] = f"ok:{field_name}"
+            except Exception as exc:
+                fill_log[key_str] = f"error:{field_name}:{exc}"
+
+        output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(output_pdf_path))
+
+    return [
+        TextContent(
+            type="text",
+            text=json.dumps(
+                {
+                    "source_pdf": str(pdf_path),
+                    "output_pdf": str(output_pdf_path),
+                    "filled": sum(1 for v in fill_log.values() if v.startswith("ok:")),
+                    "total_values": len(values),
+                    "fill_log": fill_log,
+                },
+                indent=2,
+            ),
+        )
+    ]
+
+
+def _coerce_json_object(value: Any, field_name: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items()}
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"parsing {field_name} as JSON failed: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(f"{field_name} must decode to a JSON object")
+        return {str(k): v for k, v in decoded.items()}
+    raise ValueError(f"{field_name} must be a JSON object or a JSON string")
+
+
+def _workflow_guide() -> list[TextContent]:
+    payload = {
+        "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
+        "recommended_tool_order": [
+            "analyze_form",
+            "save_field_mapping",
+            "fill_pdf_form",
+        ],
+        "tool_aliases": {
+            "prepare_form_for_analysis": "extract_form_fields",
+        },
+        "templates": {
+            "analyze_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "annotate_pages": True,
+                "ambiguity_threshold": 0.72,
+            },
+            "extract_form_fields": {
+                "pdf_path": "/path/to/form.pdf",
+                "annotate_pages": True,
+            },
+            "save_field_mapping": {
+                "pdf_path": "/path/to/form.pdf",
+                "alias_map_json": "{\"F001\":\"field.name\"}",
+                "field_analysis_json": "{\"F001\":{\"label\":\"...\",\"context\":\"...\",\"expected_value_type\":\"string\",\"expected_format\":null,\"is_required\":false,\"section\":null}}",
+                "form_family": "my_form",
+                "version": "1",
+            },
+            "fill_pdf_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "values_json": "{\"F001\":\"Alice Example\"}",
+                "alias_map_json": "{\"F001\":\"field.name\"}",
+                "output_pdf_path": "/optional/path/filled.pdf",
+            },
+        },
+        "notes": [
+            "All *_json inputs accept either JSON strings or native objects.",
+            "Use alias_map_json when values_json keys are FXXX aliases.",
+            "For best quality, use analyze_form and only manually review ambiguous_fields.",
+        ],
+    }
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _guess_semantics(field_name: str, nearby_text: str, field_type: str) -> tuple[str, float, str]:
+    candidate = (nearby_text or field_name or "").strip()
+    if not candidate:
+        return ("unknown_field", 0.25, "No nearby text or useful field name found.")
+
+    normalized = " ".join(candidate.split())
+    confidence = 0.55
+    rationale = "Derived from nearby printed text."
+    if nearby_text:
+        confidence += 0.2
+    if len(normalized) <= 60:
+        confidence += 0.1
+    if field_type.lower() in {"btn", "button", "checkbox"}:
+        rationale = "Likely checkbox/button based on field type and nearby text."
+    if any(token in normalized.lower() for token in ("date", "ssn", "zip", "phone", "email", "income", "expense")):
+        confidence += 0.1
+        rationale = "Nearby text includes recognizable semantic keywords."
+
+    confidence = max(0.05, min(0.99, confidence))
+    label = normalized[:120]
+    return (label, confidence, rationale)
+
+
+def _section_hint(
+    page: int,
+    bbox: tuple[float, float, float, float],
+    text_blocks: list[TextBlock],
+) -> str | None:
+    x0, y0, x1, y1 = bbox
+    center_y = (y0 + y1) / 2
+    candidates = []
+    for block in text_blocks:
+        if block.page != page:
+            continue
+        bx0, by0, bx1, by1 = block.bbox
+        if by1 > center_y:
+            continue
+        text = (block.text or "").strip()
+        if not text:
+            continue
+        vertical_gap = center_y - by1
+        if vertical_gap > 120:
+            continue
+        width = bx1 - bx0
+        if width < 80:
+            continue
+        candidates.append((vertical_gap, text))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1][:80]
 
 
 # ---------------------------------------------------------------------------

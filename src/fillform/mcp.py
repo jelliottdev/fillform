@@ -80,6 +80,7 @@ import base64
 import json
 import math
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -123,6 +124,7 @@ def _make_structure_service() -> PdfStructureService:
 _structure_service = _make_structure_service()
 _alias_registry = FieldAliasRegistry()
 _annotator = PdfAnnotator()
+_analysis_sessions: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +195,55 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": [],
+            },
+        ),
+        Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
+                    "persist_session": {
+                        "type": "boolean",
+                        "description": "Default true. Persist alias map/pdf path in server memory and return a session_id for follow-up calls.",
+                        "default": True,
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
+        Tool(
+            name="prepare_form_for_analysis",
+            description=(
+                "Alias for extract_form_fields (same inputs/outputs). "
+                "Use this if your agent expects the older tool name."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to receive annotated JPEG page images alongside the JSON.",
+                        "default": False,
+                    },
+                },
+                "required": ["pdf_path"],
             },
         ),
         Tool(

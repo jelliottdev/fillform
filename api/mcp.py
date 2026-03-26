@@ -245,14 +245,11 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
 
         fields_data: list[dict[str, Any]] = []
         for alias, widget in alias_map.field_widgets.items():
-            position = _position_hint_raw(widget.bbox, widget.page)
             fields_data.append({
                 "alias": alias,
-                "name": widget.name,
                 "type": widget.field_type,
                 "page": widget.page + 1,
                 "bbox": [round(v, 1) for v in widget.bbox],
-                "position": position,
             })
         fields_data.sort(key=lambda f: f["alias"])
 
@@ -261,15 +258,20 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
         result: dict[str, Any] = {
             "field_count": len(fields_data),
             "alias_map": alias_map.alias_to_field,
-            "fields": fields_data,
+            "IMPORTANT": (
+                "Field names in alias_map are internal PDF identifiers only — do NOT use them "
+                "to guess field meanings. You MUST run annotation_script and visually inspect "
+                "the saved JPEG images to determine what each FXXX collects. "
+                "Calling save_field_mapping without viewing the images will produce incorrect results."
+            ),
             "next_steps": [
-                "1. ANNOTATE: Run the python script in 'annotation_script' locally, replacing "
+                "1. ANNOTATE (required): Run the python script in 'annotation_script', replacing "
                 "PDF_PATH with the actual file path. It writes orange FXXX labels onto the form "
                 "and saves one JPEG per page to /tmp/fillform_page_N.jpg",
-                "2. VIEW: Read each /tmp/fillform_page_N.jpg image file to see the annotated form. "
-                "Each orange label shows exactly which field is FXXX.",
-                "3. IDENTIFY: Look at the annotated images and determine what each FXXX field collects.",
-                "4. SAVE: Call save_field_mapping with your analysis and the alias_map above.",
+                "2. VIEW (required): Read every /tmp/fillform_page_N.jpg image. "
+                "Each orange label shows exactly which field is which FXXX alias.",
+                "3. IDENTIFY: From the images, record what each FXXX field collects.",
+                "4. SAVE: Call save_field_mapping only after steps 1-3 are complete.",
             ],
             "annotation_script": annotation_script,
         }

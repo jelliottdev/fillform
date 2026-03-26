@@ -76,19 +76,16 @@ async def list_tools() -> list[Tool]:
                 "    python3 -c \"\n"
                 "import json,sys\n"
                 "try:\n"
-                "    import fitz; doc=fitz.open('YOUR_FILE.pdf')\n"
-                "    out=[{'name':w.field_name,'type':w.field_type_string,'page':i,'bbox':list(w.rect)}\n"
-                "         for i,p in enumerate(doc) for w in (p.widgets() or [])]\n"
+                "    import fitz\n"
                 "except ImportError:\n"
-                " from pypdf import PdfReader as _R\n"
-                " _r=_R('YOUR_FILE.pdf');_fm={'/Tx':'Tx','/Btn':'Btn','/Ch':'Ch','/Sig':'Sig'};out=[]\n"
-                " for _i,_p in enumerate(_r.pages):\n"
-                "  _h=float(_p.mediabox.height)\n"
-                "  for _a in (_p.get('/Annots') or []):\n"
-                "   _o=_a.get_object()\n"
-                "   if _o.get('/Subtype')=='/Widget' and '/T' in _o:\n"
-                "    _b=[float(v) for v in _o.get('/Rect',[0,0,100,20])]\n"
-                "    out.append({'name':str(_o['/T']),'type':_fm.get(_o.get('/FT',''),'Tx'),'page':_i,'bbox':[_b[0],_h-_b[3],_b[2],_h-_b[1]]})\n"
+                "    sys.exit('PyMuPDF required: pip install pymupdf -- pypdf silently misses checkboxes')\n"
+                "doc=fitz.open('YOUR_FILE.pdf'); out=[]\n"
+                "for i,p in enumerate(doc):\n"
+                "    for w in (p.widgets() or []):\n"
+                "        f={'name':w.field_name,'type':w.field_type_string,'page':i,'bbox':list(w.rect),'value':w.field_value}\n"
+                "        if w.field_type_string=='CheckBox': f['on_state']=w.on_state()\n"
+                "        if w.field_type_string in ('ComboBox','ListBox'): f['choices']=w.choice_values or []\n"
+                "        out.append(f)\n"
                 "sys.stdout.write(json.dumps(out))\n"
                 "    \"\n"
                 "  STEP 2 — call this tool with fields_json=<output from step 1>\n"
@@ -147,7 +144,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Build a CanonicalSchema from Claude's field analysis and return the "
                 "schema JSON plus a plain-text AI fill guide (fill script). "
-                "Call this after you have identified what every FXXX field collects."
+                "Call this after you have identified what every FXXX field collects "
+                "by visually inspecting the annotated JPEG images."
             ),
             inputSchema={
                 "type": "object",
@@ -162,7 +160,8 @@ async def list_tools() -> list[Tool]:
                             'JSON mapping each alias to its semantic description. '
                             'Structure: {"F001": {"label":"…","context":"…",'
                             '"expected_value_type":"string|date|number|boolean|signature|selection",'
-                            '"expected_format":"…or null","is_required":true|false,"section":"…or null"}, …}'
+                            '"expected_format":"…or null","is_required":true|false,"section":"…",'
+                            '"on_state":"yes"|null,"choices":["…"]|null}, …}'
                         ),
                     },
                     "form_family": {
@@ -179,6 +178,54 @@ async def list_tools() -> list[Tool]:
                 "required": ["alias_map_json", "field_analysis_json"],
             },
         ),
+        Tool(
+            name="validate_fill",
+            description=(
+                "Validate a filled PDF against the agent's intended values. "
+                "Call this after filling the form to catch errors before presenting to the user.\n\n"
+                "WORKFLOW:\n"
+                "  1. After filling the PDF, run the STEP 1 extraction snippet on the FILLED PDF "
+                "     to get actual field values (the snippet captures 'value' for each field).\n"
+                "  2. Call this tool with: filled_fields_json (output from step 1), "
+                "     intended_values (alias→value dict you tried to set), "
+                "     alias_map_json (from extract_form_fields), "
+                "     and optionally schema_json (from save_field_mapping for rule checking).\n"
+                "  3. Read the ValidationReport. If passed=false, fix flagged fields and re-validate.\n"
+                "  4. Max 3 refinement iterations, then surface remaining issues to user."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filled_fields_json": {
+                        "type": "string",
+                        "description": (
+                            "JSON array from running the STEP 1 snippet on the FILLED PDF. "
+                            "Each object must include 'name', 'type', 'value', and optionally "
+                            "'on_state' (CheckBox) and 'choices' (ComboBox/ListBox)."
+                        ),
+                    },
+                    "intended_values": {
+                        "type": "string",
+                        "description": (
+                            'JSON object mapping alias → value the agent intended to set. '
+                            'E.g. {"F001": "John Smith", "F005": "yes", "F010": "Off"}'
+                        ),
+                    },
+                    "alias_map_json": {
+                        "type": "string",
+                        "description": "The alias_map JSON from extract_form_fields (alias→field_name).",
+                    },
+                    "schema_json": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Schema JSON from save_field_mapping. "
+                            "Enables on_state checks, choices validation, and required-field checks."
+                        ),
+                    },
+                },
+                "required": ["filled_fields_json", "intended_values", "alias_map_json"],
+            },
+        ),
     ]
 
 
@@ -192,6 +239,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _extract_fields(arguments)
     if name == "save_field_mapping":
         return await _save_mapping(arguments)
+    if name == "validate_fill":
+        return await _validate_fill(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -243,14 +292,25 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
 
         alias_map = _alias_registry.assign(widgets)
 
+        # Build a lookup from field name → raw extraction data for on_state/choices passthrough
+        raw_by_name: dict[str, dict[str, Any]] = {}
+        for f in raw_fields:
+            raw_by_name[str(f.get("name") or "")] = f
+
         fields_data: list[dict[str, Any]] = []
         for alias, widget in alias_map.field_widgets.items():
-            fields_data.append({
+            raw = raw_by_name.get(widget.name, {})
+            entry: dict[str, Any] = {
                 "alias": alias,
                 "type": widget.field_type,
                 "page": widget.page + 1,
                 "bbox": [round(v, 1) for v in widget.bbox],
-            })
+            }
+            if "on_state" in raw:
+                entry["on_state"] = raw["on_state"]
+            if "choices" in raw:
+                entry["choices"] = raw["choices"]
+            fields_data.append(entry)
         fields_data.sort(key=lambda f: f["alias"])
 
         annotation_script = _build_annotation_script(fields_data)
@@ -415,10 +475,184 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
     schema_json = json.dumps(schema.to_dict(), indent=2)
     fill_script = schema.to_fill_script()
 
+    fill_rules = (
+        "═" * 60 + "\n"
+        "FILL RULES — read before filling any field\n"
+        "═" * 60 + "\n\n"
+        "CHECKBOX RULES:\n"
+        "  • To CHECK:   set field_value = on_state string (e.g. 'yes', 'Yes', 'amended')\n"
+        "  • To UNCHECK: set field_value = 'Off'  (the literal string 'Off')\n"
+        "  • NEVER set a checkbox to 'No', 'no', 'false', or '' — always 'Off'\n"
+        "  • NEVER default empty/unused rows to 'No' — leave them as 'Off'\n"
+        "    Example: debtor has 1 dependent → fill row 2a only, set rows 2b–2e to 'Off'\n\n"
+        "DROPDOWN RULES:\n"
+        "  • Set field_value to the EXACT string from choices[] — whitespace matters\n"
+        "  • Wrong strings produce silent no-ops; the field appears blank in the filled PDF\n"
+        "  • Example wrong: 'N. District of Florida'\n"
+        "  • Example correct: 'Northern District of Florida'\n\n"
+        "CONDITIONAL RULES:\n"
+        "  • Only fill sub-fields when their parent condition is true\n"
+        "  • Example: only fill 'check1a' text field when checkbox 'check1' = on_state\n"
+        "  • Example: only fill dependent rows when has_dependents checkbox = on_state\n\n"
+        "AFTER FILLING:\n"
+        "  • Call validate_fill to verify your work before presenting to the user\n"
+        "  • Run the STEP 1 snippet on the FILLED PDF to get actual values, then call validate_fill\n"
+    )
+
     return [TextContent(type="text", text=(
         f"Schema ({len(fields)} fields):\n```json\n{schema_json}\n```\n\n"
-        f"{'─' * 60}\n\n{fill_script}"
+        f"{'─' * 60}\n\n{fill_script}\n\n{fill_rules}"
     ))]
+
+
+# ---------------------------------------------------------------------------
+# validate_fill implementation
+# ---------------------------------------------------------------------------
+
+async def _validate_fill(args: dict[str, Any]) -> list[TextContent]:
+    try:
+        filled_fields: list[dict[str, Any]] = json.loads(args["filled_fields_json"])
+    except (json.JSONDecodeError, KeyError) as exc:
+        return [TextContent(type="text", text=f"ERROR parsing filled_fields_json: {exc}")]
+
+    try:
+        intended: dict[str, Any] = json.loads(args["intended_values"])
+    except (json.JSONDecodeError, KeyError) as exc:
+        return [TextContent(type="text", text=f"ERROR parsing intended_values: {exc}")]
+
+    try:
+        alias_map_raw: dict[str, Any] = json.loads(args["alias_map_json"])
+    except (json.JSONDecodeError, KeyError) as exc:
+        return [TextContent(type="text", text=f"ERROR parsing alias_map_json: {exc}")]
+
+    schema_raw: dict[str, Any] = {}
+    schema_str = args.get("schema_json") or ""
+    if schema_str:
+        try:
+            schema_raw = json.loads(schema_str)
+        except json.JSONDecodeError:
+            pass
+
+    # Build alias → field_name map
+    if "alias_index" in alias_map_raw:
+        alias_index: dict[str, str] = alias_map_raw["alias_index"]
+    else:
+        alias_index = {k: v for k, v in alias_map_raw.items() if isinstance(v, str)}
+
+    # Build field_name → filled field dict
+    filled_by_name: dict[str, dict[str, Any]] = {
+        str(f.get("name") or ""): f for f in filled_fields
+    }
+
+    # Extract schema field info if available
+    schema_fields: dict[str, dict[str, Any]] = {}
+    for sf in schema_raw.get("fields", []):
+        schema_fields[sf.get("alias", "")] = sf
+
+    issues: list[dict[str, Any]] = []
+    correct = 0
+    total = len(intended)
+
+    for alias, intended_val in intended.items():
+        field_name = alias_index.get(alias, "")
+        filled_f = filled_by_name.get(field_name, {})
+        actual_val = filled_f.get("value")
+        ftype = filled_f.get("type") or schema_fields.get(alias, {}).get("field_type", "Text")
+        sf = schema_fields.get(alias, {})
+
+        # Normalize for comparison
+        actual_str = str(actual_val) if actual_val is not None else ""
+        intended_str = str(intended_val) if intended_val is not None else ""
+
+        field_issues: list[dict[str, Any]] = []
+
+        if ftype == "CheckBox":
+            on_state = filled_f.get("on_state") or sf.get("on_state") or ""
+            # phantom_check: field is checked but intended is "Off" or not provided
+            if actual_str not in ("", "Off", None) and intended_str in ("", "Off"):
+                field_issues.append({
+                    "severity": "error",
+                    "issue": "phantom_check",
+                    "detail": f"Field is set to '{actual_str}' but should be 'Off'",
+                })
+            # wrong on_state: field is checked but with wrong value
+            elif intended_str not in ("", "Off") and actual_str not in ("", "Off"):
+                if on_state and actual_str != on_state:
+                    field_issues.append({
+                        "severity": "error",
+                        "issue": "wrong_on_state",
+                        "detail": f"Used '{actual_str}' but on_state is '{on_state}'",
+                    })
+            # checked 'no'/'No'/'false' instead of 'Off'
+            if intended_str in ("Off", "") and actual_str.lower() in ("no", "false"):
+                field_issues.append({
+                    "severity": "error",
+                    "issue": "wrong_off_value",
+                    "detail": f"Used '{actual_str}' for unchecked — must use 'Off'",
+                })
+
+        elif ftype in ("ComboBox", "ListBox"):
+            choices = filled_f.get("choices") or sf.get("choices") or []
+            if actual_str and choices and actual_str not in choices:
+                field_issues.append({
+                    "severity": "error",
+                    "issue": "invalid_choice",
+                    "detail": (
+                        f"'{actual_str}' not in choices. "
+                        f"Valid options: {choices[:5]}{'…' if len(choices) > 5 else ''}"
+                    ),
+                })
+
+        # unchanged_from_blank: intended non-empty but field still blank
+        if intended_str not in ("", "Off") and actual_str in ("", None):
+            field_issues.append({
+                "severity": "error",
+                "issue": "unchanged_from_blank",
+                "detail": f"Field still blank — value '{intended_str}' was not applied",
+            })
+
+        # value mismatch (non-checkbox, non-blank)
+        if not field_issues and actual_str != intended_str and ftype != "CheckBox":
+            if intended_str not in ("", "Off") and actual_str not in ("", "Off"):
+                field_issues.append({
+                    "severity": "warning",
+                    "issue": "value_mismatch",
+                    "detail": f"Expected '{intended_str}', got '{actual_str}'",
+                })
+
+        if field_issues:
+            for fi in field_issues:
+                fi.update({"alias": alias, "field_name": field_name, "type": ftype,
+                           "intended": intended_str, "actual": actual_str})
+                issues.append(fi)
+        else:
+            correct += 1
+
+    errors = [i for i in issues if i["severity"] == "error"]
+    warnings = [i for i in issues if i["severity"] == "warning"]
+    passed = len(errors) == 0
+
+    refinement = ""
+    if errors:
+        lines = [f"Fix {len(errors)} error(s) before presenting to user:"]
+        for i, err in enumerate(errors[:10], 1):
+            lines.append(
+                f"{i}. {err['alias']} ({err['field_name']}): {err['issue']} — {err['detail']}"
+            )
+        if len(errors) > 10:
+            lines.append(f"   … and {len(errors) - 10} more errors")
+        refinement = "\n".join(lines)
+
+    report: dict[str, Any] = {
+        "passed": passed,
+        "score": f"{correct}/{total} fields correct",
+        "errors": len(errors),
+        "warnings": len(warnings),
+        "issues": issues,
+        "refinement_instructions": refinement or "All checks passed.",
+    }
+
+    return [TextContent(type="text", text=json.dumps(report, indent=2))]
 
 
 # ---------------------------------------------------------------------------
@@ -428,14 +662,24 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 def _build_annotation_script(fields_data: list[dict[str, Any]]) -> str:
     """Return a self-contained python script Claude can run locally.
 
-    The script annotates the original PDF with orange FXXX labels and
-    saves one JPEG per page to /tmp/fillform_page_N.jpg so Claude can
-    read them and identify each field visually.
+    Overlays color-coded FXXX labels on the original PDF at 2.5× DPI and
+    saves one JPEG per page to /tmp/fillform_page_N.jpg.
+
+    Color scheme:
+      Text       → blue fill, white label centered inside rect
+      CheckBox   → green ring (no fill), green pill label to the RIGHT
+      RadioButton→ same as CheckBox
+      ComboBox   → orange fill, white label
+      ListBox    → orange fill, white label
+      Button     → purple fill, white label (agent should skip these)
     """
     fields_json = json.dumps(fields_data)
     return (
-        "# Run this script locally — replace PDF_PATH with the actual file path.\n"
-        "# It creates /tmp/fillform_page_N.jpg for each page (72 DPI, JPEG).\n"
+        "# Run locally — replace PDF_PATH with the actual file path.\n"
+        "# Saves /tmp/fillform_page_N.jpg at 2.5x DPI with color-coded FXXX labels.\n"
+        "# Legend (for reference — NOT burned into image):\n"
+        "#   Blue   = Text field       Orange = ComboBox/ListBox\n"
+        "#   Green  = CheckBox/Radio   Purple = Button (skip)\n"
         "import json, sys\n"
         "PDF_PATH = '/mnt/user-data/uploads/YOUR_FILE.pdf'  # <-- change this\n"
         "OUT_DIR  = '/tmp'\n"
@@ -446,26 +690,56 @@ def _build_annotation_script(fields_data: list[dict[str, Any]]) -> str:
         "except ImportError:\n"
         "    sys.exit('PyMuPDF (fitz) required: pip install pymupdf')\n"
         "\n"
+        "# (border_color, fill_color) — fill=None means ring only\n"
+        "COLORS = {\n"
+        "    'Text':        ((0.05, 0.25, 0.75), (0.1,  0.4,  0.9 )),\n"
+        "    'CheckBox':    ((0.0,  0.55, 0.15), None),\n"
+        "    'RadioButton': ((0.0,  0.55, 0.15), None),\n"
+        "    'ComboBox':    ((0.7,  0.25, 0.0 ), (1.0,  0.45, 0.0 )),\n"
+        "    'ListBox':     ((0.7,  0.25, 0.0 ), (1.0,  0.45, 0.0 )),\n"
+        "    'Button':      ((0.35, 0.05, 0.55), (0.5,  0.1,  0.7 )),\n"
+        "}\n"
+        "DEFAULT_COLORS = ((0.5, 0.5, 0.0), (0.8, 0.8, 0.0))\n"
+        "\n"
+        "def draw_label(page, x, y, label, fs, color=(1, 1, 1)):\n"
+        "    # Shadow pass for readability over any background\n"
+        "    for dx, dy in [(-0.4,0),(0.4,0),(0,-0.4),(0,0.4)]:\n"
+        "        page.insert_text((x+dx, y+dy), label, fontsize=fs, color=(0, 0, 0.3))\n"
+        "    page.insert_text((x, y), label, fontsize=fs, color=color)\n"
+        "\n"
         "doc = fitz.open(PDF_PATH)\n"
         "for f in FIELDS:\n"
-        "    page = doc[f['page'] - 1]  # page is 1-based in FIELDS\n"
+        "    page = doc[f['page'] - 1]\n"
         "    x0, y0, x1, y1 = f['bbox']\n"
         "    rect = fitz.Rect(x0, y0, x1, y1)\n"
-        "    # Orange filled rectangle\n"
-        "    page.draw_rect(rect, color=(0.7, 0.25, 0.0), fill=(1.0, 0.45, 0.0), width=0.5)\n"
-        "    # White alias label centred in the rect\n"
-        "    fs = max(6, min(9, (y1 - y0) * 0.7))\n"
-        "    tw = fitz.get_text_length(f['alias'], fontsize=fs)\n"
-        "    tx = x0 + max(0, (x1 - x0 - tw) / 2)\n"
-        "    ty = y0 + (y1 - y0 + fs) / 2 - 1\n"
-        "    page.insert_text((tx, ty), f['alias'], fontsize=fs, color=(1, 1, 1))\n"
+        "    ftype = f.get('type', 'Text')\n"
+        "    border_c, fill_c = COLORS.get(ftype, DEFAULT_COLORS)\n"
+        "    alias = f['alias']\n"
+        "    fs = max(5, min(8, (y1 - y0) * 0.65))\n"
         "\n"
-        "mat = fitz.Matrix(1.0, 1.0)  # 72 DPI — increase to 1.5 if labels are hard to read\n"
+        "    if ftype in ('CheckBox', 'RadioButton'):\n"
+        "        # Ring only — preserve the checkbox visual, label goes to the right\n"
+        "        page.draw_rect(rect, color=border_c, fill=None, width=1.2)\n"
+        "        tw = fitz.get_text_length(alias, fontsize=fs)\n"
+        "        px0 = x1 + 2\n"
+        "        py0, py1 = y0, y1\n"
+        "        pill = fitz.Rect(px0 - 1, py0, px0 + tw + 3, py1)\n"
+        "        page.draw_rect(pill, color=border_c, fill=(0.85, 1.0, 0.87), width=0.5)\n"
+        "        ty = py0 + (py1 - py0 + fs) / 2 - 1\n"
+        "        draw_label(page, px0 + 1, ty, alias, fs, color=(0.0, 0.4, 0.1))\n"
+        "    else:\n"
+        "        page.draw_rect(rect, color=border_c, fill=fill_c, width=0.5)\n"
+        "        tw = fitz.get_text_length(alias, fontsize=fs)\n"
+        "        tx = x0 + max(0, (x1 - x0 - tw) / 2)\n"
+        "        ty = y0 + (y1 - y0 + fs) / 2 - 1\n"
+        "        draw_label(page, tx, ty, alias, fs)\n"
+        "\n"
+        "mat = fitz.Matrix(2.5, 2.5)  # 180 DPI — labels readable on small checkbox fields\n"
         "saved = []\n"
         "for i, page in enumerate(doc):\n"
         "    pix = page.get_pixmap(matrix=mat, alpha=False)\n"
         "    out = f'{OUT_DIR}/fillform_page_{i+1}.jpg'\n"
-        "    pix.save(out, jpg_quality=82)\n"
+        "    pix.save(out, jpg_quality=85)\n"
         "    saved.append(out)\n"
         "print('Saved:', saved)\n"
     )

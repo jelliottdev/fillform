@@ -64,35 +64,31 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="extract_form_fields",
             description=(
-                "Assign sequential FXXX aliases (F001, F002, …) to AcroForm fields and "
-                "return a compact JSON object with the alias map and per-field metadata "
-                "(page, bbox, type, position). Response is text-only JSON — no images.\n\n"
-                "THREE input modes — use the first one that works:\n\n"
-                "  MODE 1 — fields_json (BEST, zero context cost):\n"
-                "    Extract field data locally with python, pass the JSON string.\n"
-                "    Run this python one-liner first (no output shown in conversation):\n"
-                "      python3 -c \"\n"
-                "import json, sys\n"
+                "Full form-mapping pipeline: assign sequential FXXX aliases (F001, F002, …) "
+                "to AcroForm fields, then return everything needed to visually identify each "
+                "field via the orange-overlay approach — with ZERO context overflow.\n\n"
+                "WORKFLOW (4 steps):\n"
+                "  STEP 1 — extract field data locally (run this python snippet, capture output):\n"
+                "    python3 -c \"\n"
+                "import json,sys\n"
                 "try:\n"
-                "    import fitz\n"
-                "    doc = fitz.open('/mnt/user-data/uploads/YOUR_FILE.pdf')\n"
-                "    out = [{'name': w.field_name, 'type': w.field_type_string,\n"
-                "            'page': i, 'bbox': list(w.rect)}\n"
-                "           for i, p in enumerate(doc) for w in (p.widgets() or [])]\n"
+                "    import fitz; doc=fitz.open('YOUR_FILE.pdf')\n"
+                "    out=[{'name':w.field_name,'type':w.field_type_string,'page':i,'bbox':list(w.rect)}\n"
+                "         for i,p in enumerate(doc) for w in (p.widgets() or [])]\n"
                 "except ImportError:\n"
-                "    from pypdf import PdfReader\n"
-                "    r = PdfReader('/mnt/user-data/uploads/YOUR_FILE.pdf')\n"
-                "    out = [{'name': k, 'type': 'Tx', 'page': 0, 'bbox': [0,0,100,20]}\n"
-                "           for k in (r.get_fields() or {})]\n"
+                "    from pypdf import PdfReader; r=PdfReader('YOUR_FILE.pdf')\n"
+                "    out=[{'name':k,'type':'Tx','page':0,'bbox':[0,0,100,20]} for k in (r.get_fields() or {})]\n"
                 "sys.stdout.write(json.dumps(out))\n"
-                "      \"\n"
-                "    Then pass the output as fields_json. This outputs ~5KB, not the whole PDF.\n\n"
-                "  MODE 2 — file_path: server reads the file directly.\n"
-                "    Works only if the server can access the path (local server only).\n\n"
-                "  MODE 3 — pdf_base64: AVOID unless modes 1 and 2 both fail.\n"
-                "    Do NOT run 'base64 <file>' in bash — that prints the full file into the\n"
-                "    conversation and causes context overflow. This mode is only viable for\n"
-                "    PDFs under ~200KB."
+                "    \"\n"
+                "  STEP 2 — call this tool with fields_json=<output from step 1>\n"
+                "  STEP 3 — run the 'annotation_script' returned by this tool. It overlays\n"
+                "    vibrant orange FXXX labels on the PDF and saves JPEG images to /tmp/.\n"
+                "  STEP 4 — read each /tmp/fillform_page_N.jpg and identify what every\n"
+                "    FXXX field collects. Then call save_field_mapping.\n\n"
+                "INPUT MODES (use fields_json — it sends ~5KB, not the whole PDF):\n"
+                "  fields_json  BEST — pre-extracted locally, zero context cost\n"
+                "  file_path    local server only (Vercel cannot access local paths)\n"
+                "  pdf_base64   AVOID — causes context overflow for PDFs > 200KB"
             ),
             inputSchema={
                 "type": "object",
@@ -246,15 +242,22 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
             })
         fields_data.sort(key=lambda f: f["alias"])
 
+        annotation_script = _build_annotation_script(fields_data)
+
         result: dict[str, Any] = {
             "field_count": len(fields_data),
             "alias_map": alias_map.alias_to_field,
             "fields": fields_data,
-            "instructions": (
-                "Use the original PDF attachment in your conversation to identify what "
-                "each field collects. Match fields by their 'position' and 'name'. "
-                "Once all fields are identified, call save_field_mapping."
-            ),
+            "next_steps": [
+                "1. ANNOTATE: Run the python script in 'annotation_script' locally, replacing "
+                "PDF_PATH with the actual file path. It writes orange FXXX labels onto the form "
+                "and saves one JPEG per page to /tmp/fillform_page_N.jpg",
+                "2. VIEW: Read each /tmp/fillform_page_N.jpg image file to see the annotated form. "
+                "Each orange label shows exactly which field is FXXX.",
+                "3. IDENTIFY: Look at the annotated images and determine what each FXXX field collects.",
+                "4. SAVE: Call save_field_mapping with your analysis and the alias_map above.",
+            ],
+            "annotation_script": annotation_script,
         }
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -405,6 +408,52 @@ async def _save_mapping(args: dict[str, Any]) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 # Helpers: nearby-text extraction and position hints
 # ---------------------------------------------------------------------------
+
+def _build_annotation_script(fields_data: list[dict[str, Any]]) -> str:
+    """Return a self-contained python script Claude can run locally.
+
+    The script annotates the original PDF with orange FXXX labels and
+    saves one JPEG per page to /tmp/fillform_page_N.jpg so Claude can
+    read them and identify each field visually.
+    """
+    fields_json = json.dumps(fields_data)
+    return (
+        "# Run this script locally — replace PDF_PATH with the actual file path.\n"
+        "# It creates /tmp/fillform_page_N.jpg for each page (72 DPI, JPEG).\n"
+        "import json, sys\n"
+        "PDF_PATH = '/mnt/user-data/uploads/YOUR_FILE.pdf'  # <-- change this\n"
+        "OUT_DIR  = '/tmp'\n"
+        f"FIELDS = {fields_json}\n"
+        "\n"
+        "try:\n"
+        "    import fitz\n"
+        "except ImportError:\n"
+        "    sys.exit('PyMuPDF (fitz) required: pip install pymupdf')\n"
+        "\n"
+        "doc = fitz.open(PDF_PATH)\n"
+        "for f in FIELDS:\n"
+        "    page = doc[f['page'] - 1]  # page is 1-based in FIELDS\n"
+        "    x0, y0, x1, y1 = f['bbox']\n"
+        "    rect = fitz.Rect(x0, y0, x1, y1)\n"
+        "    # Orange filled rectangle\n"
+        "    page.draw_rect(rect, color=(0.7, 0.25, 0.0), fill=(1.0, 0.45, 0.0), width=0.5)\n"
+        "    # White alias label centred in the rect\n"
+        "    fs = max(6, min(9, (y1 - y0) * 0.7))\n"
+        "    tw = fitz.get_text_length(f['alias'], fontsize=fs)\n"
+        "    tx = x0 + max(0, (x1 - x0 - tw) / 2)\n"
+        "    ty = y0 + (y1 - y0 + fs) / 2 - 1\n"
+        "    page.insert_text((tx, ty), f['alias'], fontsize=fs, color=(1, 1, 1))\n"
+        "\n"
+        "mat = fitz.Matrix(1.0, 1.0)  # 72 DPI — increase to 1.5 if labels are hard to read\n"
+        "saved = []\n"
+        "for i, page in enumerate(doc):\n"
+        "    pix = page.get_pixmap(matrix=mat, alpha=False)\n"
+        "    out = f'{OUT_DIR}/fillform_page_{i+1}.jpg'\n"
+        "    pix.save(out, jpg_quality=82)\n"
+        "    saved.append(out)\n"
+        "print('Saved:', saved)\n"
+    )
+
 
 def _find_nearby_text(
     bbox: tuple[float, float, float, float],

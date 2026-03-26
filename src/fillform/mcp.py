@@ -34,6 +34,13 @@ complete_form
     High-level pipeline: analyze + (optional demo data generation) + fill +
     completion report in one call.
 
+fill_form
+    Semantic fill helper that accepts business-level keys and auto-maps them to
+    aliases/field names using label guesses.
+
+validate_form
+    Lightweight post-fill QA that reports unresolved and potentially empty fields.
+
 Usage
 -----
 **stdio** (local process, Claude Code default)::
@@ -341,6 +348,44 @@ async def list_tools() -> list[Tool]:
                 "required": ["pdf_path"],
             },
         ),
+        Tool(
+            name="fill_form",
+            description=(
+                "Fill using semantic keys (for example 'full_name', 'filing_status'). "
+                "The tool auto-maps keys to aliases/field names and returns mapping confidence."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {"type": "string"},
+                    "semantic_data_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Semantic key/value payload.",
+                    },
+                    "output_pdf_path": {"type": "string"},
+                },
+                "required": ["pdf_path", "semantic_data_json"],
+            },
+        ),
+        Tool(
+            name="validate_form",
+            description=(
+                "Run a lightweight validation pass on a filled PDF and report likely "
+                "empty fields and field coverage counts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {"type": "string"},
+                    "expected_min_fill_ratio": {
+                        "type": "number",
+                        "default": 0.6,
+                        "description": "Warn if less than this ratio of fields appear populated.",
+                    },
+                },
+                "required": ["pdf_path"],
+            },
+        ),
     ]
 
 
@@ -364,6 +409,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _fill_pdf_form(arguments)
     if name == "complete_form":
         return await _complete_form(arguments)
+    if name == "fill_form":
+        return await _fill_form(arguments)
+    if name == "validate_form":
+        return await _validate_form(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -771,6 +820,82 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
     return content
 
 
+async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
+    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+    output_pdf_path = Path(
+        str(args.get("output_pdf_path") or (pdf_path.parent / f"{pdf_path.stem}_semantic_filled.pdf"))
+    ).expanduser().resolve()
+    try:
+        semantic_data = _coerce_json_object(args.get("semantic_data_json"), "semantic_data_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    try:
+        structure = _structure_service.extract(pdf_path)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
+    alias_map = _alias_registry.assign(structure.field_widgets)
+    mapped_values, mapping_report = _map_semantic_data_to_aliases(
+        semantic_data=semantic_data,
+        alias_map=alias_map.alias_to_field,
+        structure=structure,
+    )
+    fill_log = _fill_pdf_document(
+        pdf_path=pdf_path,
+        output_pdf_path=output_pdf_path,
+        values=mapped_values,
+        alias_map=alias_map.alias_to_field,
+    )
+    return [TextContent(type="text", text=json.dumps({
+        "source_pdf": str(pdf_path),
+        "output_pdf": str(output_pdf_path),
+        "semantic_keys": len(semantic_data),
+        "mapped_fields": len(mapped_values),
+        "mapping_report": mapping_report,
+        "fill_log": fill_log,
+    }, indent=2))]
+
+
+async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
+    pdf_path = Path(str(args.get("pdf_path") or "")).expanduser().resolve()
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+    expected_min_fill_ratio = float(args.get("expected_min_fill_ratio", 0.6))
+    expected_min_fill_ratio = max(0.0, min(1.0, expected_min_fill_ratio))
+    try:
+        import fitz
+    except ImportError as exc:
+        return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
+
+    total = 0
+    populated = 0
+    likely_empty: list[dict[str, Any]] = []
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index, page in enumerate(doc, start=1):
+            for widget in page.widgets() or []:
+                if not widget.field_name:
+                    continue
+                total += 1
+                value = str(widget.field_value or "").strip()
+                if value:
+                    populated += 1
+                else:
+                    likely_empty.append({"field_name": str(widget.field_name), "page": page_index})
+    fill_ratio = (populated / total) if total else 0.0
+    result = {
+        "pdf_path": str(pdf_path),
+        "total_fields": total,
+        "populated_fields": populated,
+        "fill_ratio": round(fill_ratio, 3),
+        "status": "pass" if fill_ratio >= expected_min_fill_ratio else "warn",
+        "expected_min_fill_ratio": expected_min_fill_ratio,
+        "likely_empty_fields_sample": likely_empty[:50],
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
 def _coerce_json_object(value: Any, field_name: str) -> dict[str, Any]:
     if isinstance(value, dict):
         return {str(k): v for k, v in value.items()}
@@ -822,12 +947,25 @@ def _workflow_guide() -> list[TextContent]:
                 "mode": "demo",
                 "preview_pages": True,
             },
+            "fill_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "semantic_data_json": {
+                    "full_name": "Jordan Demo",
+                    "date": "03/26/2026",
+                    "filing_status": "single",
+                },
+            },
+            "validate_form": {
+                "pdf_path": "/path/to/filled.pdf",
+                "expected_min_fill_ratio": 0.6,
+            },
         },
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
             "Use complete_form for a single-call pipeline with explicit completion_status.",
+            "Use fill_form if you only have semantic keys and want auto-mapping.",
         ],
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
@@ -941,6 +1079,50 @@ def _demo_value_for_field(label_guess: str, field_type: str) -> str:
     if any(tok in text for tok in ("income", "expense", "amount", "total", "rent", "tax", "insurance")):
         return "450.00"
     return "Demo Value"
+
+
+def _map_semantic_data_to_aliases(
+    semantic_data: dict[str, Any],
+    alias_map: dict[str, str],
+    structure: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    label_index: dict[str, tuple[str, str, float]] = {}
+    widget_by_name = {w.name: w for w in structure.field_widgets}
+    for alias, field_name in alias_map.items():
+        widget = widget_by_name.get(field_name)
+        if widget is None:
+            continue
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        label, confidence, _ = _guess_semantics(field_name, nearby, widget.field_type)
+        label_index[alias] = (field_name, label.lower(), confidence)
+
+    mapped: dict[str, Any] = {}
+    report: list[dict[str, Any]] = []
+    for semantic_key, value in semantic_data.items():
+        key_tokens = set(_tokenize(str(semantic_key)))
+        best_alias = None
+        best_score = -1.0
+        for alias, (_field_name, label_lower, base_conf) in label_index.items():
+            label_tokens = set(_tokenize(label_lower))
+            if not label_tokens:
+                continue
+            overlap = len(key_tokens & label_tokens)
+            score = overlap / max(len(key_tokens), 1)
+            score = score * 0.8 + base_conf * 0.2
+            if score > best_score:
+                best_score = score
+                best_alias = alias
+        if best_alias is not None and best_score >= 0.35:
+            mapped[best_alias] = value
+            report.append({"semantic_key": semantic_key, "mapped_to": best_alias, "score": round(best_score, 3)})
+        else:
+            report.append({"semantic_key": semantic_key, "mapped_to": None, "score": round(max(best_score, 0.0), 3)})
+    return mapped, report
+
+
+def _tokenize(text: str) -> list[str]:
+    cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    return [tok for tok in cleaned.split() if tok]
 
 
 # ---------------------------------------------------------------------------

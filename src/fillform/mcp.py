@@ -10,6 +10,10 @@ Tools
 fillform_workflow_guide
     Returns a compact quickstart and tool-call templates for agents.
 
+analyze_form
+    One-shot form understanding: extracts fields, guesses semantic labels,
+    returns confidence scores, and highlights ambiguous fields.
+
 extract_form_fields
     Extract AcroForm fields, assign FXXX aliases, render annotated pages, and
     return the alias map JSON + one PNG image per page.  Claude reads the images
@@ -119,6 +123,33 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {},
+            },
+        ),
+        Tool(
+            name="analyze_form",
+            description=(
+                "One-shot semantic analysis for an AcroForm PDF. Returns field-level "
+                "label guesses, confidence scores, section hints, and an ambiguity list."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "annotate_pages": {
+                        "type": "boolean",
+                        "description": "Default false. Set true to attach annotated page images.",
+                        "default": False,
+                    },
+                    "ambiguity_threshold": {
+                        "type": "number",
+                        "description": "Confidence below this value is flagged as ambiguous (0..1). Default 0.72.",
+                        "default": 0.72,
+                    },
+                },
+                "required": ["pdf_path"],
             },
         ),
         Tool(
@@ -279,6 +310,8 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent]:
     if name == "fillform_workflow_guide":
         return _workflow_guide()
+    if name == "analyze_form":
+        return await _analyze_form(arguments)
     if name == "extract_form_fields":
         return await _extract_fields(arguments)
     if name == "prepare_form_for_analysis":
@@ -381,6 +414,101 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
         finally:
             annotated_path.unlink(missing_ok=True)
 
+    return content
+
+
+async def _analyze_form(args: dict[str, Any]) -> list[TextContent | ImageContent]:
+    pdf_path = Path(args["pdf_path"]).expanduser().resolve()
+    annotate_pages = bool(args.get("annotate_pages", False))
+    threshold_raw = args.get("ambiguity_threshold", 0.72)
+    try:
+        ambiguity_threshold = float(threshold_raw)
+    except (TypeError, ValueError):
+        ambiguity_threshold = 0.72
+    ambiguity_threshold = max(0.0, min(1.0, ambiguity_threshold))
+
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    try:
+        structure = _structure_service.extract(pdf_path)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
+
+    if not structure.field_widgets:
+        return [TextContent(type="text", text=(
+            f"No AcroForm fields found in '{pdf_path.name}'. "
+            "This pipeline requires a PDF with interactive AcroForm fields."
+        ))]
+
+    alias_map = _alias_registry.assign(structure.field_widgets)
+    analysis_fields: list[dict[str, Any]] = []
+    ambiguous_fields: list[dict[str, Any]] = []
+
+    for alias, widget in sorted(alias_map.field_widgets.items()):
+        nearby = _find_nearby_text(widget.bbox, widget.page, structure.text_blocks)
+        page_dim = next((pd for pd in structure.page_dimensions if pd.page == widget.page), None)
+        section_hint = _section_hint(widget.page, widget.bbox, structure.text_blocks)
+        label_guess, confidence, rationale = _guess_semantics(
+            field_name=widget.name,
+            nearby_text=nearby,
+            field_type=widget.field_type,
+        )
+        entry = {
+            "alias": alias,
+            "field_name": widget.name,
+            "field_type": widget.field_type,
+            "page": widget.page + 1,
+            "bbox": [round(v, 1) for v in widget.bbox],
+            "position": _position_hint(widget.bbox, widget.page, page_dim),
+            "label_guess": label_guess,
+            "section_hint": section_hint,
+            "confidence": round(confidence, 3),
+            "rationale": rationale,
+            "nearby_text": nearby,
+        }
+        analysis_fields.append(entry)
+        if confidence < ambiguity_threshold:
+            ambiguous_fields.append(
+                {
+                    "alias": alias,
+                    "confidence": round(confidence, 3),
+                    "label_guess": label_guess,
+                    "suggested_review": "Confirm this field manually from the annotated page image.",
+                }
+            )
+
+    result: dict[str, Any] = {
+        "pdf_path": str(pdf_path),
+        "field_count": len(analysis_fields),
+        "alias_map": alias_map.alias_to_field,
+        "alias_map_json": json.dumps(alias_map.alias_to_field),
+        "ambiguity_threshold": ambiguity_threshold,
+        "ambiguous_count": len(ambiguous_fields),
+        "ambiguous_fields": ambiguous_fields,
+        "fields": analysis_fields,
+        "next_actions": {
+            "save_field_mapping": "Use alias_map_json + your verified field analysis.",
+            "fill_pdf_form": "After collecting user data, pass values_json and alias_map_json.",
+        },
+    }
+
+    content: list[TextContent | ImageContent] = [
+        TextContent(type="text", text=json.dumps(result, indent=2))
+    ]
+    if annotate_pages:
+        tmp = tempfile.NamedTemporaryFile(suffix="_annotated.pdf", delete=False)
+        tmp.close()
+        annotated_path = Path(tmp.name)
+        try:
+            _annotator.annotate(pdf_path, alias_map, annotated_path)
+            for i, img_b64 in enumerate(_render_pages(annotated_path), start=1):
+                content.append(TextContent(type="text", text=f"--- Analyze Form Page {i} ---"))
+                content.append(ImageContent(type="image", data=img_b64, mimeType="image/jpeg"))
+        except Exception as exc:
+            content.append(TextContent(type="text", text=f"WARNING: annotation failed: {exc}"))
+        finally:
+            annotated_path.unlink(missing_ok=True)
     return content
 
 
@@ -555,7 +683,7 @@ def _workflow_guide() -> list[TextContent]:
     payload = {
         "purpose": "Agent-friendly workflow for extracting, mapping, and filling AcroForm PDFs.",
         "recommended_tool_order": [
-            "extract_form_fields",
+            "analyze_form",
             "save_field_mapping",
             "fill_pdf_form",
         ],
@@ -563,6 +691,11 @@ def _workflow_guide() -> list[TextContent]:
             "prepare_form_for_analysis": "extract_form_fields",
         },
         "templates": {
+            "analyze_form": {
+                "pdf_path": "/path/to/form.pdf",
+                "annotate_pages": True,
+                "ambiguity_threshold": 0.72,
+            },
             "extract_form_fields": {
                 "pdf_path": "/path/to/form.pdf",
                 "annotate_pages": True,
@@ -584,9 +717,63 @@ def _workflow_guide() -> list[TextContent]:
         "notes": [
             "All *_json inputs accept either JSON strings or native objects.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
+            "For best quality, use analyze_form and only manually review ambiguous_fields.",
         ],
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _guess_semantics(field_name: str, nearby_text: str, field_type: str) -> tuple[str, float, str]:
+    candidate = (nearby_text or field_name or "").strip()
+    if not candidate:
+        return ("unknown_field", 0.25, "No nearby text or useful field name found.")
+
+    normalized = " ".join(candidate.split())
+    confidence = 0.55
+    rationale = "Derived from nearby printed text."
+    if nearby_text:
+        confidence += 0.2
+    if len(normalized) <= 60:
+        confidence += 0.1
+    if field_type.lower() in {"btn", "button", "checkbox"}:
+        rationale = "Likely checkbox/button based on field type and nearby text."
+    if any(token in normalized.lower() for token in ("date", "ssn", "zip", "phone", "email", "income", "expense")):
+        confidence += 0.1
+        rationale = "Nearby text includes recognizable semantic keywords."
+
+    confidence = max(0.05, min(0.99, confidence))
+    label = normalized[:120]
+    return (label, confidence, rationale)
+
+
+def _section_hint(
+    page: int,
+    bbox: tuple[float, float, float, float],
+    text_blocks: list[TextBlock],
+) -> str | None:
+    x0, y0, x1, y1 = bbox
+    center_y = (y0 + y1) / 2
+    candidates = []
+    for block in text_blocks:
+        if block.page != page:
+            continue
+        bx0, by0, bx1, by1 = block.bbox
+        if by1 > center_y:
+            continue
+        text = (block.text or "").strip()
+        if not text:
+            continue
+        vertical_gap = center_y - by1
+        if vertical_gap > 120:
+            continue
+        width = bx1 - bx0
+        if width < 80:
+            continue
+        candidates.append((vertical_gap, text))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1][:80]
 
 
 # ---------------------------------------------------------------------------

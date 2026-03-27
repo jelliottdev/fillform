@@ -536,6 +536,170 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="arithmetic_validate",
+            description=(
+                "Evaluate cross-field arithmetic constraints on a fill payload. "
+                "Checks sum_of, diff_of, equals_field, and percent_of rules defined "
+                "in the schema. Returns expected vs. actual values and pass/fail per check."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema_json": {
+                        "description": "CanonicalSchema as a JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "values_json": {
+                        "description": "Fill payload values as JSON string or object (alias→value).",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "schema_family": {
+                        "type": "string",
+                        "description": "Form family name if schema_json is not provided.",
+                    },
+                    "schema_version": {
+                        "type": "string",
+                        "description": "Schema version if schema_json is not provided.",
+                        "default": "1",
+                    },
+                },
+                "required": ["values_json"],
+            },
+        ),
+        Tool(
+            name="visual_qa",
+            description=(
+                "Inspect the visual appearance of a filled PDF. "
+                "Detects fields that appear visually empty, text overflow, "
+                "and checkbox appearance mismatches. "
+                "Use mode='pixel' for rendered pixel-level inspection (slower, more accurate) "
+                "or mode='text' for fast text-extraction-based checks."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute path to the FILLED PDF to inspect."),
+                    "schema_json": {
+                        "description": "CanonicalSchema as a JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "values_json": {
+                        "description": "Fill payload values as JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "'text' (fast, default) or 'pixel' (rendered, more accurate).",
+                        "default": "text",
+                    },
+                    "dpi": {
+                        "type": "integer",
+                        "description": "Render DPI for pixel mode. Default 150.",
+                        "default": 150,
+                    },
+                    "session_id": {"type": "string"},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="quality_report",
+            description=(
+                "Compute fill quality metrics against legal-grade thresholds. "
+                "Reports fill_accuracy, required_coverage, verification_match, "
+                "visual_pass, and arithmetic_pass rates. "
+                "Returns meets_legal_grade_threshold flag and per-metric detail."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema_json": {
+                        "description": "CanonicalSchema as JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "fill_log_json": {
+                        "description": "fill_log from fill_pdf_form (JSON string or object).",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "verification_json": {
+                        "description": "Verification report JSON from validate_form.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "values_json": {
+                        "description": "Fill payload values (for required_coverage check).",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="schema_diff",
+            description=(
+                "Compare two versions of the same form schema to detect added, removed, "
+                "and changed fields. Returns a migration plan with ranked actions: "
+                "carry-forward, re-review, remove-key, and add-required."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "old_schema_json": {
+                        "description": "Old CanonicalSchema as JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "new_schema_json": {
+                        "description": "New CanonicalSchema as JSON string or object.",
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
+                    "include_migration_plan": {
+                        "type": "boolean",
+                        "description": "Default true. Include ranked migration actions.",
+                        "default": True,
+                    },
+                },
+                "required": ["old_schema_json", "new_schema_json"],
+            },
+        ),
+        Tool(
+            name="packet_validate",
+            description=(
+                "Validate cross-form consistency for a Chapter 7 or Chapter 13 "
+                "bankruptcy packet. Checks that all required forms are present, "
+                "debtor identity (name/SSN/case number) is consistent across forms, "
+                "and cross-form arithmetic rules pass. "
+                "Pass forms as a list of {form_family, schema_json, values_json} objects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "matter_id": {
+                        "type": "string",
+                        "description": "Unique matter or case identifier.",
+                    },
+                    "chapter": {
+                        "type": "string",
+                        "description": "'7' or '13'. Default '7'.",
+                        "default": "7",
+                    },
+                    "forms_json": {
+                        "description": (
+                            "Array of filled forms. Each element must have: "
+                            "form_family (string), schema_json (CanonicalSchema object or string), "
+                            "values_json (fill payload object or string). "
+                            "Pass as a JSON string or a JSON array."
+                        ),
+                        "oneOf": [{"type": "string"}, {"type": "array"}],
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "'json' (default) or 'markdown'.",
+                        "default": "json",
+                    },
+                },
+                "required": ["matter_id", "forms_json"],
+            },
+        ),
     ]
 
 
@@ -581,6 +745,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _validate_form(arguments)
     if name == "map_fill_validate":
         return await _map_fill_validate(arguments)
+    if name == "arithmetic_validate":
+        return await _arithmetic_validate(arguments)
+    if name == "visual_qa":
+        return await _visual_qa(arguments)
+    if name == "quality_report":
+        return await _quality_report(arguments)
+    if name == "schema_diff":
+        return await _schema_diff(arguments)
+    if name == "packet_validate":
+        return await _packet_validate(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -2150,6 +2324,251 @@ def _position_hint(
     horiz = "left" if cx < 0.4 else ("right" if cx > 0.6 else "center")
     vert = "upper" if cy < 0.33 else ("lower" if cy > 0.66 else "middle")
     return f"page {page + 1}, {vert}-{horiz}"
+
+
+# ---------------------------------------------------------------------------
+# New module tool handlers
+# ---------------------------------------------------------------------------
+
+async def _arithmetic_validate(args: dict[str, Any]) -> list[TextContent]:
+    from .arithmetic import ArithmeticValidator
+    from .contracts import CanonicalSchema, FillPayload
+
+    try:
+        schema_raw = _coerce_json_object(args.get("schema_json"), "schema_json") if args.get("schema_json") else None
+        values_raw = _coerce_json_object(args.get("values_json"), "values_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    if schema_raw is None:
+        return [TextContent(type="text", text="ERROR: schema_json is required for arithmetic_validate.")]
+
+    try:
+        schema = CanonicalSchema.from_dict(schema_raw)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR parsing schema: {exc}")]
+
+    family = schema.form_family
+    version = schema.version
+    payload = FillPayload(schema_family=family, schema_version=version, values=values_raw)
+
+    validator = ArithmeticValidator()
+    report = validator.validate(payload=payload, schema=schema)
+    return [TextContent(type="text", text=json.dumps(report.to_dict(), indent=2))]
+
+
+async def _visual_qa(args: dict[str, Any]) -> list[TextContent]:
+    from .contracts import CanonicalSchema, FillPayload
+    from .visual_qa import VisualQAEngine
+
+    session = get_session(args.get("session_id"))
+    try:
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    schema_raw = None
+    if args.get("schema_json"):
+        try:
+            schema_raw = _coerce_json_object(args.get("schema_json"), "schema_json")
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
+    if schema_raw is None:
+        return [TextContent(type="text", text="ERROR: schema_json is required for visual_qa.")]
+
+    try:
+        schema = CanonicalSchema.from_dict(schema_raw)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR parsing schema: {exc}")]
+
+    values_raw: dict[str, Any] = {}
+    if args.get("values_json"):
+        try:
+            values_raw = _coerce_json_object(args.get("values_json"), "values_json")
+        except ValueError:
+            pass
+
+    payload = FillPayload(
+        schema_family=schema.form_family,
+        schema_version=schema.version,
+        values=values_raw,
+    )
+
+    mode = str(args.get("mode") or "text").strip().lower()
+    dpi = int(args.get("dpi") or 150)
+    engine = VisualQAEngine()
+
+    try:
+        if mode == "pixel":
+            report = engine.render_check(filled_pdf=pdf_path, schema=schema, payload=payload, dpi=dpi)
+        else:
+            report = engine.check(filled_pdf=pdf_path, schema=schema, payload=payload)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR during visual QA: {exc}")]
+
+    return [TextContent(type="text", text=json.dumps(report.to_dict(), indent=2))]
+
+
+async def _quality_report(args: dict[str, Any]) -> list[TextContent]:
+    from .contracts import CanonicalSchema, FillPayload, VerificationReport
+    from .fill_engine import FillResult
+    from .quality import QualityReport
+
+    schema_raw = None
+    if args.get("schema_json"):
+        try:
+            schema_raw = _coerce_json_object(args.get("schema_json"), "schema_json")
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
+    if schema_raw is None:
+        return [TextContent(type="text", text="ERROR: schema_json is required for quality_report.")]
+
+    try:
+        schema = CanonicalSchema.from_dict(schema_raw)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR parsing schema: {exc}")]
+
+    # Fill log → synthetic FillResult
+    fill_result: FillResult | None = None
+    if args.get("fill_log_json"):
+        try:
+            fill_log = _coerce_json_object(args.get("fill_log_json"), "fill_log_json")
+            # Build a minimal FillResult from the log
+            from pathlib import Path as _Path
+            fill_result = FillResult(
+                draft_pdf_path=_Path("/dev/null"),
+                flattened_pdf_path=_Path("/dev/null"),
+                fill_log=fill_log,
+            )
+        except Exception:
+            pass
+
+    verification: VerificationReport | None = None
+    if args.get("verification_json"):
+        try:
+            v_raw = _coerce_json_object(args.get("verification_json"), "verification_json")
+            verification = VerificationReport.from_dict(v_raw)
+        except Exception:
+            pass
+
+    payload: FillPayload | None = None
+    if args.get("values_json"):
+        try:
+            values_raw = _coerce_json_object(args.get("values_json"), "values_json")
+            payload = FillPayload(
+                schema_family=schema.form_family,
+                schema_version=schema.version,
+                values=values_raw,
+            )
+        except Exception:
+            pass
+
+    report = QualityReport.from_artifacts(
+        schema=schema,
+        fill_result=fill_result,
+        verification=verification,
+        payload=payload,
+    )
+    return [TextContent(type="text", text=json.dumps(report.to_dict(), indent=2))]
+
+
+async def _schema_diff(args: dict[str, Any]) -> list[TextContent]:
+    from .contracts import CanonicalSchema
+    from .schema_diff import diff_schemas, migration_plan
+
+    try:
+        old_raw = _coerce_json_object(args.get("old_schema_json"), "old_schema_json")
+        new_raw = _coerce_json_object(args.get("new_schema_json"), "new_schema_json")
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    try:
+        old_schema = CanonicalSchema.from_dict(old_raw)
+        new_schema = CanonicalSchema.from_dict(new_raw)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR parsing schema(s): {exc}")]
+
+    diff = diff_schemas(old_schema, new_schema)
+    result: dict[str, Any] = {"diff": diff.to_dict(), "summary": diff.summary()}
+
+    if bool(args.get("include_migration_plan", True)):
+        plan = migration_plan(diff)
+        result["migration_plan"] = [a.to_dict() for a in plan]
+        result["migration_summary"] = {
+            "total_actions": len(plan),
+            "carry_forward": sum(1 for a in plan if a.kind == "carry_forward"),
+            "re_review": sum(1 for a in plan if a.kind == "re_review"),
+            "remove_key": sum(1 for a in plan if a.kind == "remove_key"),
+            "add_required": sum(1 for a in plan if a.kind == "add_required"),
+        }
+
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _packet_validate(args: dict[str, Any]) -> list[TextContent]:
+    from .contracts import CanonicalSchema, FillPayload
+    from .packet import FilledForm, FormPacket, PacketValidator
+
+    matter_id = args.get("matter_id", "unknown")
+    chapter = str(args.get("chapter", "7"))
+    output_format = str(args.get("output_format", "json"))
+
+    # Parse forms array
+    forms_raw = args.get("forms_json")
+    if forms_raw is None:
+        return [TextContent(type="text", text="ERROR: forms_json is required")]
+    if isinstance(forms_raw, str):
+        try:
+            forms_raw = json.loads(forms_raw)
+        except json.JSONDecodeError as exc:
+            return [TextContent(type="text", text=f"ERROR: forms_json is not valid JSON: {exc}")]
+    if not isinstance(forms_raw, list):
+        return [TextContent(type="text", text="ERROR: forms_json must be a JSON array")]
+
+    packet = FormPacket(matter_id=matter_id, chapter=chapter)
+
+    for i, form_entry in enumerate(forms_raw):
+        if not isinstance(form_entry, dict):
+            return [TextContent(type="text", text=f"ERROR: forms_json[{i}] must be an object")]
+        form_family = form_entry.get("form_family", f"form_{i}")
+
+        # Parse schema
+        schema_raw = form_entry.get("schema_json")
+        if schema_raw is None:
+            return [TextContent(type="text", text=f"ERROR: forms_json[{i}].schema_json is required")]
+        try:
+            schema_raw = _coerce_json_object(schema_raw, f"forms_json[{i}].schema_json")
+            schema = CanonicalSchema.from_dict(schema_raw)
+        except Exception as exc:
+            return [TextContent(type="text", text=f"ERROR parsing schema for form {form_family}: {exc}")]
+
+        # Parse values
+        values_raw = form_entry.get("values_json", {})
+        try:
+            values_raw = _coerce_json_object(values_raw, f"forms_json[{i}].values_json")
+        except Exception as exc:
+            return [TextContent(type="text", text=f"ERROR parsing values for form {form_family}: {exc}")]
+
+        payload = FillPayload(
+            schema_family=schema.form_family,
+            schema_version=schema.version,
+            values=values_raw,
+        )
+        packet.add_form(FilledForm(
+            form_family=form_family,
+            schema=schema,
+            payload=payload,
+        ))
+
+    validator = PacketValidator()
+    report = validator.validate(packet)
+
+    if output_format == "markdown":
+        return [TextContent(type="text", text=report.to_markdown())]
+    return [TextContent(type="text", text=json.dumps(report.to_dict(), indent=2))]
 
 
 # ---------------------------------------------------------------------------

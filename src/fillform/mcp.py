@@ -492,6 +492,21 @@ async def list_tools() -> list[Tool]:
                         "default": 0.6,
                         "description": "Warn if less than this ratio of fields appear populated.",
                     },
+                    "expected_values_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": (
+                            "Optional expected values mapping. Keys may be FXXX aliases or raw field names. "
+                            "When provided, validate_form returns value-match verification details."
+                        ),
+                    },
+                    "alias_map_json": {
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                        "description": "Optional alias map for FXXX keys in expected_values_json.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: session_id to reuse alias map/fingerprint context.",
+                    },
                 },
                 "required": [],
             },
@@ -920,6 +935,11 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
         alias_map=alias_map,
     )
     fill_log = fill_report["fill_log"]
+    verification = _verify_expected_values(
+        pdf_path=output_pdf_path,
+        expected_values=values,
+        alias_map=alias_map,
+    )
 
     return [
         TextContent(
@@ -932,6 +952,7 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
                     "total_values": len(values),
                     "fill_log": fill_log,
                     "changed_fields": fill_report["changed_fields"],
+                    "verification": verification,
                 },
                 indent=2,
             ),
@@ -1034,6 +1055,11 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         ),
         3,
     )
+    verification = _verify_expected_values(
+        pdf_path=output_pdf_path,
+        expected_values=fill_values,
+        alias_map=alias_map.alias_to_field,
+    )
     completion_is_complete = (not unresolved) and (not strict_validation or not logic_issues)
     try:
         source_fingerprint = compute_pdf_fingerprint(pdf_path)
@@ -1066,6 +1092,9 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         "repair_summary": repair_summary,
         "fill_ratio": metrics["fill_ratio"],
         "quality_score": quality_score,
+        "expected_value_match_rate": verification["match_rate"],
+        "mismatch_count": verification["mismatch_count"],
+        "mismatch_sample": verification["mismatches"][:25],
         "process_report": {
             "used_annotation_vision": False,
             "used_semantic_analysis": True,
@@ -1136,8 +1165,9 @@ async def _fill_form(args: dict[str, Any]) -> list[TextContent]:
 
 
 async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
+    session = get_session(args.get("session_id"))
     try:
-        pdf_path = resolve_pdf_source(args)
+        pdf_path = resolve_pdf_source(args, default_path=(session.get("pdf_path") if session else None))
     except ValueError as exc:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
@@ -1163,6 +1193,37 @@ async def _validate_form(args: dict[str, Any]) -> list[TextContent]:
     result["logic_issues_sample"] = logic_issues[:50]
     if logic_issues and result["status"] == "pass":
         result["status"] = "warn"
+
+    expected_values: dict[str, Any] | None = None
+    if args.get("expected_values_json") is not None:
+        try:
+            expected_values = _coerce_json_object(args.get("expected_values_json"), "expected_values_json")
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    if expected_values is not None:
+        alias_map: dict[str, str] = {}
+        if args.get("alias_map_json") is not None:
+            try:
+                alias_map_raw = _coerce_json_object(args.get("alias_map_json"), "alias_map_json")
+                if "alias_index" in alias_map_raw and isinstance(alias_map_raw["alias_index"], dict):
+                    alias_map = {str(k): str(v) for k, v in alias_map_raw["alias_index"].items()}
+                else:
+                    alias_map = {str(k): str(v) for k, v in alias_map_raw.items()}
+            except ValueError as exc:
+                return [TextContent(type="text", text=f"ERROR: {exc}")]
+        elif session and session.get("alias_map"):
+            alias_map = dict(session["alias_map"])
+
+        verification = _verify_expected_values(
+            pdf_path=pdf_path,
+            expected_values=expected_values,
+            alias_map=alias_map,
+        )
+        result["verification"] = verification
+        result["expected_value_match_rate"] = verification["match_rate"]
+        if verification["mismatch_count"] and result["status"] == "pass":
+            result["status"] = "warn"
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
@@ -1293,6 +1354,9 @@ def _workflow_guide() -> list[TextContent]:
                 "pdf_path": "/path/to/filled.pdf",
                 "pdf_bytes_base64": "<optional base64 bytes>",
                 "expected_min_fill_ratio": 0.6,
+                "expected_values_json": "{\"F001\":\"Alice Example\"}",
+                "alias_map_json": "{\"F001\":\"field.name\"}",
+                "session_id": "<optional>",
             },
             "map_fill_validate": {
                 "pdf_path": "/path/to/form.pdf",
@@ -1876,6 +1940,79 @@ def _basic_fill_metrics(pdf_path: Path) -> tuple[int, int, float, list[dict[str,
                     likely_empty.append({"field_name": str(widget.field_name), "page": page_index})
     fill_ratio = (populated / total) if total else 0.0
     return total, populated, fill_ratio, likely_empty
+
+
+def _verify_expected_values(
+    pdf_path: Path,
+    expected_values: dict[str, Any],
+    alias_map: dict[str, str],
+) -> dict[str, Any]:
+    import fitz
+
+    mismatches: list[dict[str, Any]] = []
+    checked = 0
+    with fitz.open(str(pdf_path)) as doc:
+        widgets_by_name: dict[str, list[Any]] = {}
+        for page in doc:
+            for widget in page.widgets() or []:
+                name = str(widget.field_name or "")
+                if name:
+                    widgets_by_name.setdefault(name, []).append(widget)
+
+        for key, expected in expected_values.items():
+            field_name = alias_map.get(str(key), str(key))
+            widgets = widgets_by_name.get(field_name) or []
+            if not widgets:
+                mismatches.append({
+                    "input_key": str(key),
+                    "field_name": field_name,
+                    "reason": "missing_field",
+                })
+                continue
+            checked += 1
+
+            if len(widgets) > 1 and _normalize_checkbox_choice(expected) in {"yes", "no"}:
+                selected = _selected_yes_no_from_widgets(widgets)
+                expected_choice = _normalize_checkbox_choice(expected)
+                if selected != expected_choice:
+                    mismatches.append({
+                        "input_key": str(key),
+                        "field_name": field_name,
+                        "expected": expected_choice,
+                        "actual": selected,
+                    })
+                continue
+
+            widget = widgets[0]
+            actual = str(widget.field_value or "")
+            expected_text = "" if expected is None else str(expected)
+            if _is_checkbox_widget(widget):
+                selected_state = _selected_yes_no_from_widgets(widgets)
+                expected_choice = _normalize_checkbox_choice(expected)
+                if expected_choice is not None:
+                    if selected_state != expected_choice:
+                        mismatches.append({
+                            "input_key": str(key),
+                            "field_name": field_name,
+                            "expected": expected_choice,
+                            "actual": selected_state,
+                        })
+                    continue
+            if actual != expected_text:
+                mismatches.append({
+                    "input_key": str(key),
+                    "field_name": field_name,
+                    "expected": expected_text,
+                    "actual": actual,
+                })
+
+    match_rate = 0.0 if checked == 0 else (checked - len(mismatches)) / checked
+    return {
+        "checked_fields": checked,
+        "mismatch_count": len(mismatches),
+        "match_rate": round(max(0.0, match_rate), 3),
+        "mismatches": mismatches,
+    }
 
 
 def _demo_value_for_field(label_guess: str, field_type: str) -> str:

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .arithmetic import ArithmeticValidator
 from .contracts import (
     CanonicalField,
     CanonicalSchema,
@@ -139,6 +140,12 @@ class VerificationEngine:
             constraint_check = self._constraint_check(payload=payload, schema=schema)
             if constraint_check is not None:
                 checks.append(constraint_check)
+
+        # ── 5. Arithmetic / cross-field totals ────────────────────────────
+        if schema is not None:
+            arith_check = self._arithmetic_check(payload=payload, schema=schema)
+            if arith_check is not None:
+                checks.append(arith_check)
 
         verified = all(c.status in {"passed", "skipped"} for c in checks)
 
@@ -633,4 +640,57 @@ class VerificationEngine:
             message=f"{len(issues)} constraint violation(s) detected.",
             issues=issues,
             metadata={"issue_count": len(issues)},
+        )
+
+    def _arithmetic_check(
+        self,
+        payload: FillPayload,
+        schema: CanonicalSchema,
+    ) -> VerificationCheck | None:
+        """Evaluate all arithmetic constraints (sum_of, diff_of, equals_field, percent_of).
+
+        Returns None when no arithmetic constraints are defined on the schema,
+        so the check is silently skipped for forms that don't need it.
+        """
+        arithmetic_rules = {"sum_of", "diff_of", "equals_field", "percent_of"}
+        has_arith = any(
+            c.rule in arithmetic_rules
+            for f in schema.fields
+            for c in f.constraints
+        )
+        if not has_arith:
+            return None
+
+        report = ArithmeticValidator().validate(payload, schema)
+        non_skipped = [c for c in report.checks if c.status != "skipped"]
+        if not non_skipped:
+            return None
+
+        issues = report.as_validation_issues()
+        failed_count = len(report.failed)
+        total_count = len(non_skipped)
+
+        if failed_count:
+            return VerificationCheck(
+                check_id="arithmetic_validation",
+                status="failed",
+                category="arithmetic",
+                message=(
+                    f"{failed_count} of {total_count} arithmetic constraint(s) failed. "
+                    "Totals may not match line items."
+                ),
+                issues=issues,
+                metadata={
+                    "total_checks": total_count,
+                    "failed_checks": failed_count,
+                    "passed_checks": total_count - failed_count,
+                },
+            )
+
+        return VerificationCheck(
+            check_id="arithmetic_validation",
+            status="passed",
+            category="arithmetic",
+            message=f"All {total_count} arithmetic constraint(s) passed.",
+            metadata={"total_checks": total_count},
         )

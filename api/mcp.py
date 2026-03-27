@@ -28,6 +28,7 @@ import json
 import math
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -39,6 +40,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import ImageContent, TextContent, Tool
 
 from fillform.annotator import PdfAnnotator
+from fillform.bankruptcy_forms import USCourtsBankruptcyFormsSync
 from fillform.contracts import CanonicalField, CanonicalSchema
 from fillform.field_alias import FieldAliasRegistry
 from fillform.structure import PdfStructureService, PyMuPdfStructureAdapter, TextBlock
@@ -52,6 +54,8 @@ server = Server("fillform")
 _structure_service = PdfStructureService(adapter=PyMuPdfStructureAdapter())
 _alias_registry = FieldAliasRegistry()
 _annotator = PdfAnnotator()  # only used when annotate_pages=True
+_analytics_cache: dict[str, Any] = {"ts": 0, "payload": None}
+_ANALYTICS_TTL_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +850,122 @@ def _render_pages(pdf_path: Path, dpi: int = 72) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class _App:
+    async def _send_json(self, send, payload: dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"application/json; charset=utf-8")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def _send_html(self, send, html: str, status: int = 200) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"text/html; charset=utf-8")],
+            }
+        )
+        await send({"type": "http.response.body", "body": html.encode("utf-8")})
+
+    def _analytics_payload(self) -> dict[str, Any]:
+        now = int(time.time())
+        cached_payload = _analytics_cache.get("payload")
+        cached_ts = int(_analytics_cache.get("ts", 0) or 0)
+        if cached_payload and (now - cached_ts) < _ANALYTICS_TTL_SECONDS:
+            return dict(cached_payload)
+
+        state_path = Path("/tmp/fillform_bankruptcy_state.json")
+        out_dir = Path("/tmp/fillform_bankruptcy_forms")
+        syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
+        result = syncer.sync(output_dir=out_dir, state_path=state_path, download_pdfs=False)
+        manifest_path = Path(result.manifest_path)
+        forms = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        rows = []
+        for slug, record in sorted(forms.items()):
+            if not isinstance(record, dict):
+                continue
+            rows.append(
+                {
+                    "slug": slug,
+                    "pdf_url": record.get("pdf_url"),
+                    "page_url": record.get("page_url"),
+                    "published_at": record.get("pdf_last_modified") or "",
+                }
+            )
+        payload = {
+            "generated_at_unix": int(time.time()),
+            "counts": {
+                "forms_in_index": result.total_index_forms,
+                "pdf_records": result.total_pdf_forms,
+                "added": len(result.added),
+                "removed": len(result.removed),
+                "changed": len(result.changed),
+            },
+            "added": result.added,
+            "removed": result.removed,
+            "changed": result.changed,
+            "forms": rows,
+        }
+        _analytics_cache["ts"] = now
+        _analytics_cache["payload"] = dict(payload)
+        return payload
+
+    def _home_html(self) -> str:
+        return """<!doctype html>
+<html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/>
+<title>FillForm Bankruptcy MCP</title>
+<style>
+body{font-family:Inter,system-ui,sans-serif;margin:2rem;max-width:1100px}
+code,pre{background:#f5f5f5;padding:.2rem .4rem;border-radius:6px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border:1px solid #ddd;padding:.45rem;vertical-align:top}
+th{background:#fafafa;text-align:left}
+.muted{color:#666}
+</style></head>
+<body>
+<h1>FillForm — Bankruptcy MCP Setup</h1>
+<p class='muted'>Simple Vercel landing page with MCP setup + live bankruptcy form analytics.</p>
+<h2>1) MCP Setup</h2>
+<p>Use this URL for your MCP server:</p>
+<pre><code>https://YOUR-VERCEL-DOMAIN.vercel.app</code></pre>
+<p>Claude settings snippet:</p>
+<pre><code>{
+  "mcpServers": {
+    "fillform": { "url": "https://YOUR-VERCEL-DOMAIN.vercel.app" }
+  }
+}</code></pre>
+<h2>2) Tutorial — Get any bankruptcy doc</h2>
+<ol>
+  <li>Call <code>extract_form_fields</code> with local field JSON or a PDF input.</li>
+  <li>Review aliases and map each field meaning.</li>
+  <li>Call <code>save_field_mapping</code> to create schema + fill guide.</li>
+  <li>Fill and then call <code>validate_fill</code> to QA the output.</li>
+</ol>
+<h2>3) Live bankruptcy form analytics</h2>
+<p class='muted'>This checks USCourts, computes diffs, and shows publish headers when available (cached up to 5 minutes).</p>
+<button onclick='load()'>Refresh analytics</button>
+<pre id='summary'>Loading…</pre>
+<table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'></tbody></table>
+<script>
+async function load(){
+  const res=await fetch('/bankruptcy-analytics.json',{cache:'no-store'});
+  const data=await res.json();
+  document.getElementById('summary').textContent=JSON.stringify(data.counts,null,2)+
+    "\\nAdded: "+data.added.join(', ')+"\\nChanged: "+data.changed.join(', ');
+  const rows=document.getElementById('rows'); rows.innerHTML='';
+  data.forms.slice(0,250).forEach(f=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${f.slug}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
+    rows.appendChild(tr);
+  });
+}
+load();
+</script></body></html>"""
+
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
             await receive()
@@ -853,15 +973,20 @@ class _App:
             await receive()
             await send({"type": "lifespan.shutdown.complete"})
             return
-        # Per MCP streamable-HTTP spec: 405 on GET tells clients to use POST-only mode.
-        # Required for serverless — no persistent SSE connections possible.
+        path = scope.get("path", "/")
         if scope.get("method") == "GET":
-            await send({
-                "type": "http.response.start",
-                "status": 405,
-                "headers": [(b"content-type", b"application/json"), (b"allow", b"POST, DELETE")],
-            })
-            await send({"type": "http.response.body", "body": b""})
+            if path in ("/", "/index.html"):
+                await self._send_html(send, self._home_html(), status=200)
+                return
+            if path == "/bankruptcy-analytics.json":
+                try:
+                    payload = self._analytics_payload()
+                except Exception as exc:
+                    await self._send_json(send, {"ok": False, "error": str(exc)}, status=502)
+                    return
+                await self._send_json(send, {"ok": True, **payload}, status=200)
+                return
+            await self._send_json(send, {"ok": False, "error": "Not found"}, status=404)
             return
         mgr = StreamableHTTPSessionManager(app=server, stateless=True, json_response=True)
         async with mgr.run():

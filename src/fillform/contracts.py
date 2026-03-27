@@ -15,6 +15,55 @@ PdfType = Literal["acroform", "digital", "scanned"]
 
 
 @dataclass(frozen=True)
+class FieldConstraint:
+    """A validation rule attached to a :class:`CanonicalField`.
+
+    ``rule`` names and their ``params`` keys
+    -----------------------------------------
+    ``min_value``
+        ``{"value": <number>}`` — numeric value must be >= value.
+    ``max_value``
+        ``{"value": <number>}`` — numeric value must be <= value.
+    ``enum``
+        ``{"values": [str, ...]}`` — value must be one of the listed strings.
+    ``required_if``
+        ``{"field": "<alias>", "value": "<expected>"}`` — this field is required
+        when the referenced field equals *expected*.
+    ``exclusive_with``
+        ``{"fields": ["<alias>", ...]}`` — at most one field in the group may be
+        truthy (used for mutually-exclusive checkbox groups).
+    ``derived_from``
+        ``{"expression": "<human-readable formula>"}`` — informational; marks
+        that this field's value should be calculated, not entered manually.
+    ``pattern``
+        ``{"regex": "<pattern>"}`` — value must match the regex.
+    ``min_length``
+        ``{"value": <int>}`` — string length must be >= value.
+    ``max_length``
+        ``{"value": <int>}`` — string length must be <= value.
+    """
+
+    rule: str                           # See docstring for valid rule names
+    params: dict[str, Any] = field(default_factory=dict)
+    message: str | None = None          # Override message shown on violation
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule": self.rule,
+            "params": dict(self.params),
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "FieldConstraint":
+        return cls(
+            rule=str(payload["rule"]),
+            params=dict(payload.get("params") or {}),
+            message=payload.get("message"),
+        )
+
+
+@dataclass(frozen=True)
 class CanonicalField:
     """Semantic description of a single form field, enriched by vision analysis."""
 
@@ -30,6 +79,7 @@ class CanonicalField:
     expected_format: str | None = None  # e.g. "MM/DD/YYYY", "XXX-XX-XXXX"
     is_required: bool = False
     section: str | None = None          # Form section / group name
+    constraints: tuple[FieldConstraint, ...] = ()  # Validation rules for this field
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,11 +94,15 @@ class CanonicalField:
             "expected_format": self.expected_format,
             "is_required": self.is_required,
             "section": self.section,
+            "constraints": [c.to_dict() for c in self.constraints],
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "CanonicalField":
         bbox_raw = payload["bbox"]
+        constraints = tuple(
+            FieldConstraint.from_dict(c) for c in payload.get("constraints") or []
+        )
         return cls(
             alias=str(payload["alias"]),
             field_name=str(payload["field_name"]),
@@ -61,6 +115,7 @@ class CanonicalField:
             expected_format=payload.get("expected_format"),
             is_required=bool(payload.get("is_required", False)),
             section=payload.get("section"),
+            constraints=constraints,
         )
 
 

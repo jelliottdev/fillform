@@ -24,12 +24,15 @@ Claude Code / claude.ai URL config::
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import html
 import json
 import math
+import re
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import parse_qs
@@ -915,10 +918,10 @@ class _App:
             return self._index_catalogue_payload()
 
         if manifest_path is None:
-            syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
             try:
-                result = syncer.sync(output_dir=out_dir, state_path=state_path, download_pdfs=False)
-                manifest_path = Path(result.manifest_path)
+                result = self._run_sync_with_timeout(out_dir=out_dir, state_path=state_path, timeout_seconds=8.0)
+                if result is not None:
+                    manifest_path = Path(result.manifest_path)
             except Exception:
                 if state_path.exists():
                     try:
@@ -944,10 +947,13 @@ class _App:
                     "pdf_url": record.get("pdf_url"),
                     "page_url": record.get("page_url"),
                     "published_at": record.get("pdf_last_modified") or "",
+                    "doc_type": self._doc_type_from_url(str(record.get("pdf_url") or "")),
                 }
             )
+        analytics = self._build_extended_analytics(rows)
         payload = {
             "generated_at_unix": int(time.time()),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
             "counts": {
                 "forms_in_index": (result.total_index_forms if result else None),
                 "pdf_records": len(rows),
@@ -958,11 +964,30 @@ class _App:
             "added": (result.added if result else []),
             "removed": (result.removed if result else []),
             "changed": (result.changed if result else []),
+            "source": ("manifest" if result else "manifest-cache"),
+            "analytics": analytics,
             "forms": rows,
         }
         _analytics_cache["ts"] = now
         _analytics_cache["payload"] = dict(payload)
         return payload
+
+    def _run_sync_with_timeout(
+        self,
+        out_dir: Path,
+        state_path: Path,
+        timeout_seconds: float,
+    ):
+        def _do_sync():
+            syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
+            return syncer.sync(output_dir=out_dir, state_path=state_path, download_pdfs=False)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_do_sync)
+            try:
+                return future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                return None
 
     def _index_catalogue_payload(self) -> dict[str, Any]:
         """Fast fallback payload based only on the bankruptcy index page."""
@@ -975,11 +1000,13 @@ class _App:
                 "pdf_url": page_url,
                 "page_url": page_url,
                 "published_at": "",
+                "doc_type": self._doc_type_from_url(page_url),
             }
             for page_url in pages
         ]
         return {
             "generated_at_unix": int(time.time()),
+            "generated_at_iso": datetime.now(timezone.utc).isoformat(),
             "counts": {
                 "forms_in_index": len(pages),
                 "pdf_records": len(rows),
@@ -990,8 +1017,44 @@ class _App:
             "added": [],
             "removed": [],
             "changed": [],
+            "analytics": self._build_extended_analytics(rows),
             "forms": rows,
             "source": "index_fallback",
+        }
+
+    def _doc_type_from_url(self, url: str) -> str:
+        lower = url.lower()
+        if lower.endswith(".pdf") and ("_ins" in lower or "instruction" in lower):
+            return "instruction_pdf"
+        if "/forms-rules/forms/" in lower:
+            return "form_page"
+        if lower.endswith(".pdf"):
+            return "form_pdf"
+        return "other"
+
+    def _build_extended_analytics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        chapter_counts = {"7": 0, "11": 0, "12": 0, "13": 0}
+        schedule_count = 0
+        published_count = 0
+        doc_type_counts: dict[str, int] = {}
+        for row in rows:
+            slug = str(row.get("slug") or "").lower()
+            if slug.startswith("schedule-"):
+                schedule_count += 1
+            m = re.search(r"chapter-(7|11|12|13)", slug)
+            if m:
+                chapter_counts[m.group(1)] += 1
+            if row.get("published_at"):
+                published_count += 1
+            dtype = str(row.get("doc_type") or "unknown")
+            doc_type_counts[dtype] = doc_type_counts.get(dtype, 0) + 1
+
+        return {
+            "schedule_records": schedule_count,
+            "published_header_records": published_count,
+            "chapter_counts": chapter_counts,
+            "doc_type_counts": doc_type_counts,
+            "unique_page_count": len({str(r.get("page_url") or "") for r in rows}),
         }
 
     def _home_html(self, base_url: str, initial_payload: dict[str, Any] | None = None) -> str:
@@ -1044,6 +1107,7 @@ th{background:#fafafa;text-align:left}
 <p class='muted'>This checks USCourts, computes diffs, and shows publish headers when available (cached up to 5 minutes).</p>
 <button onclick='load(true)'>Refresh analytics</button>
 <pre id='summary'>__SUMMARY__</pre>
+<pre id='details'>__DETAILS__</pre>
 <table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'>__ROWS__</tbody></table>
 <script>
 async function load(force){
@@ -1054,6 +1118,7 @@ async function load(force){
     if(!data.ok){ document.getElementById('summary').textContent='Analytics error: '+(data.error||'unknown'); return; }
     document.getElementById('summary').textContent=JSON.stringify(data.counts,null,2)+
       "\\nAdded: "+data.added.join(', ')+"\\nChanged: "+data.changed.join(', ');
+    document.getElementById('details').textContent=JSON.stringify(data.analytics||{},null,2);
     const rows=document.getElementById('rows'); rows.innerHTML='';
     data.forms.forEach(f=>{
       const tr=document.createElement('tr');
@@ -1062,13 +1127,16 @@ async function load(force){
     });
   }catch(err){
     document.getElementById('summary').textContent='Analytics request failed: '+String(err);
+    document.getElementById('details').textContent='';
   }
 }
 if(!document.getElementById('rows').children.length){ load(false); }
 </script></body></html>"""
+        details_text = json.dumps(initial_payload.get("analytics", {}), indent=2)
         return (
             html.replace("__BASE_URL__", base_url)
             .replace("__SUMMARY__", summary_text)
+            .replace("__DETAILS__", details_text)
             .replace("__ROWS__", rows_markup)
         )
 

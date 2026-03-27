@@ -29,6 +29,7 @@ This repo now includes a Starlette app for mirroring official US Courts bankrupt
 - Vercel UI routes:
   - `/` MCP setup + tutorial + live analytics dashboard
   - `/bankruptcy-analytics.json` analytics data feed (`?refresh=1` to force a live refresh)
+  - Analytics now includes richer fields (`analytics.chapter_counts`, `analytics.schedule_records`, `analytics.doc_type_counts`, `analytics.unique_page_count`)
 - Behavior: reads the bankruptcy index, uses the US Courts sitemap to skip unchanged form pages, downloads PDFs, stores a manifest snapshot, and returns a diff (`added`, `removed`, `changed`) versus the previous sync.
 - Each form page can contribute multiple PDFs (e.g., schedule form + related instruction PDF); the manifest stores each discovered PDF as a separate record.
 - When `download_pdfs=false`, the syncer still probes PDF headers (`ETag` / `Last-Modified` when available) to improve change detection without full file downloads.

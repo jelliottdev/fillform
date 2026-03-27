@@ -911,6 +911,9 @@ class _App:
             except Exception:
                 manifest_path = None
 
+        if manifest_path is None and not refresh:
+            return self._index_catalogue_payload()
+
         if manifest_path is None:
             syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
             try:
@@ -1079,12 +1082,7 @@ if(!document.getElementById('rows').children.length){ load(false); }
         path = scope.get("path", "/")
         if scope.get("method") == "GET":
             if path in ("/", "/index.html"):
-                initial_payload: dict[str, Any] | None = None
-                try:
-                    initial_payload = {"ok": True, **self._analytics_payload(refresh=False)}
-                except Exception:
-                    initial_payload = None
-                await self._send_html(send, self._home_html(self._base_url(scope), initial_payload), status=200)
+                await self._send_html(send, self._home_html(self._base_url(scope), None), status=200)
                 return
             if path == "/bankruptcy-analytics.json":
                 query = parse_qs((scope.get("query_string") or b"").decode("utf-8", "ignore"))

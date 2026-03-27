@@ -24,6 +24,7 @@ Claude Code / claude.ai URL config::
 from __future__ import annotations
 
 import base64
+import html
 import json
 import math
 import sys
@@ -990,7 +991,22 @@ class _App:
             "source": "index_fallback",
         }
 
-    def _home_html(self, base_url: str) -> str:
+    def _home_html(self, base_url: str, initial_payload: dict[str, Any] | None = None) -> str:
+        initial_payload = initial_payload or {"counts": {}, "added": [], "changed": [], "forms": []}
+        counts_text = json.dumps(initial_payload.get("counts", {}), indent=2)
+        summary_text = f"{counts_text}\\nAdded: {', '.join(initial_payload.get('added', []))}\\nChanged: {', '.join(initial_payload.get('changed', []))}"
+        rows_html = []
+        for row in initial_payload.get("forms", []):
+            if not isinstance(row, dict):
+                continue
+            slug = html.escape(str(row.get("slug", "")))
+            published = html.escape(str(row.get("published_at", "")))
+            pdf_url = html.escape(str(row.get("pdf_url", "")))
+            rows_html.append(
+                f"<tr><td>{slug}</td><td>{published}</td><td><a href='{pdf_url}' target='_blank'>open</a></td></tr>"
+            )
+        rows_markup = "".join(rows_html)
+
         html = """<!doctype html>
 <html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/>
 <title>FillForm Bankruptcy MCP</title>
@@ -1024,8 +1040,8 @@ th{background:#fafafa;text-align:left}
 <h2>3) Live bankruptcy form analytics</h2>
 <p class='muted'>This checks USCourts, computes diffs, and shows publish headers when available (cached up to 5 minutes).</p>
 <button onclick='load(true)'>Refresh analytics</button>
-<pre id='summary'>Loading…</pre>
-<table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'></tbody></table>
+<pre id='summary'>__SUMMARY__</pre>
+<table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'>__ROWS__</tbody></table>
 <script>
 async function load(force){
   try{
@@ -1045,9 +1061,13 @@ async function load(force){
     document.getElementById('summary').textContent='Analytics request failed: '+String(err);
   }
 }
-load(false);
+if(!document.getElementById('rows').children.length){ load(false); }
 </script></body></html>"""
-        return html.replace("__BASE_URL__", base_url)
+        return (
+            html.replace("__BASE_URL__", base_url)
+            .replace("__SUMMARY__", summary_text)
+            .replace("__ROWS__", rows_markup)
+        )
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
@@ -1059,7 +1079,12 @@ load(false);
         path = scope.get("path", "/")
         if scope.get("method") == "GET":
             if path in ("/", "/index.html"):
-                await self._send_html(send, self._home_html(self._base_url(scope)), status=200)
+                initial_payload: dict[str, Any] | None = None
+                try:
+                    initial_payload = {"ok": True, **self._analytics_payload(refresh=False)}
+                except Exception:
+                    initial_payload = None
+                await self._send_html(send, self._home_html(self._base_url(scope), initial_payload), status=200)
                 return
             if path == "/bankruptcy-analytics.json":
                 query = parse_qs((scope.get("query_string") or b"").decode("utf-8", "ignore"))

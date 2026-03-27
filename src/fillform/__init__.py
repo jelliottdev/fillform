@@ -1,6 +1,8 @@
 """FillForm architecture skeleton package."""
 
 from .annotator import PdfAnnotator
+from .bankruptcy_forms import SyncResult, USCourtsBankruptcyFormsSync
+from .bankruptcy_tool import BankruptcyFormsTool, BankruptcySyncRequest
 from .contracts import (
     ArtifactRef,
     CanonicalField,
@@ -43,6 +45,10 @@ __all__ = [
     "FieldAliasRegistry",
     # PDF annotation
     "PdfAnnotator",
+    "USCourtsBankruptcyFormsSync",
+    "SyncResult",
+    "BankruptcyFormsTool",
+    "BankruptcySyncRequest",
     # Vision analysis
     "VisionFieldMapper",
     # Core services

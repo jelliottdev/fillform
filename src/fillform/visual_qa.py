@@ -339,3 +339,244 @@ class VisualQAEngine:
             page=page_idx,
             status="ok",
         )
+
+    # ------------------------------------------------------------------
+    # Pixel-level rendered inspection (opt-in — slower than text extraction)
+    # ------------------------------------------------------------------
+
+    def render_check(
+        self,
+        filled_pdf: str | Path,
+        schema: CanonicalSchema,
+        payload: FillPayload,
+        dpi: int = 150,
+    ) -> VisualQAReport:
+        """Render each page to pixels and inspect field regions at the pixel level.
+
+        This is more accurate than :meth:`check` (which relies on text extraction)
+        because it catches:
+
+        - Fields with white/invisible text that ``get_text()`` still reports
+        - Checkboxes whose appearance stream does not match the stored value
+          (i.e. the mark is missing even though the field is "checked")
+        - Text that actually overflows its box in the rendered output
+
+        Parameters
+        ----------
+        filled_pdf:
+            Path to the filled PDF output.
+        schema:
+            Canonical schema providing field geometry.
+        payload:
+            Fill payload (what was intended per field).
+        dpi:
+            Render resolution.  150 is a good balance; use 200 for dense forms.
+
+        Returns
+        -------
+        :class:`VisualQAReport` — same structure as :meth:`check`, so both can
+        be combined or compared.
+        """
+        try:
+            import fitz
+        except ImportError as exc:
+            raise RuntimeError(
+                "PyMuPDF (fitz) is required for pixel-level visual QA. "
+                "Install it with: pip install pymupdf"
+            ) from exc
+
+        pdf = Path(filled_pdf)
+        scale = dpi / 72.0
+        mat = fitz.Matrix(scale, scale)
+
+        alias_to_field: dict[str, CanonicalField] = {f.alias: f for f in schema.fields}
+        field_name_to_field: dict[str, CanonicalField] = {f.field_name: f for f in schema.fields}
+
+        intended: dict[str, Any] = {}
+        for key, value in payload.values.items():
+            canonical = alias_to_field.get(str(key)) or field_name_to_field.get(str(key))
+            if canonical is not None:
+                intended[canonical.alias] = value
+
+        # Group fields by page so we only render each page once
+        fields_by_page: dict[int, list[CanonicalField]] = {}
+        for f in schema.fields:
+            if f.alias in intended:
+                fields_by_page.setdefault(f.page, []).append(f)
+
+        issues: list[VisualFieldResult] = []
+        checked = 0
+
+        with fitz.open(str(pdf)) as doc:
+            widgets_by_name: dict[str, list[Any]] = {}
+            for page in doc:
+                for w in page.widgets() or []:
+                    if w.field_name:
+                        widgets_by_name.setdefault(str(w.field_name), []).append(w)
+
+            for page_idx, page_fields in sorted(fields_by_page.items()):
+                if page_idx >= doc.page_count:
+                    continue
+                page = doc.load_page(page_idx)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                pix_width = pix.width
+                samples: bytes = pix.samples  # RGB, 3 bytes per pixel
+
+                for canonical in page_fields:
+                    expected_value = intended.get(canonical.alias)
+                    expected_text = "" if expected_value is None else str(expected_value)
+                    checked += 1
+
+                    ft = (canonical.field_type or "").lower()
+                    is_checkbox = ft in {"btn", "button"} or any(
+                        "checkbox" in str(getattr(w, "field_type_string", "")).lower()
+                        or str(getattr(w, "field_type", "")) == "2"
+                        for w in (widgets_by_name.get(canonical.field_name) or [])
+                    )
+
+                    x0, y0, x1, y1 = canonical.bbox
+                    px0 = max(0, int(x0 * scale))
+                    py0 = max(0, int(y0 * scale))
+                    px1 = min(pix_width, int(x1 * scale))
+                    py1 = min(pix.height, int(y1 * scale))
+
+                    if px1 <= px0 or py1 <= py0:
+                        continue
+
+                    if is_checkbox:
+                        result = self._pixel_check_checkbox(
+                            alias=canonical.alias,
+                            field_name=canonical.field_name,
+                            page_idx=page_idx,
+                            samples=samples,
+                            pix_width=pix_width,
+                            px0=px0, py0=py0, px1=px1, py1=py1,
+                            expected_text=expected_text,
+                        )
+                    else:
+                        result = self._pixel_check_text_field(
+                            alias=canonical.alias,
+                            field_name=canonical.field_name,
+                            page_idx=page_idx,
+                            samples=samples,
+                            pix_width=pix_width,
+                            px0=px0, py0=py0, px1=px1, py1=py1,
+                            expected_text=expected_text,
+                            field_width_pts=x1 - x0,
+                        )
+
+                    if result.status != "ok":
+                        issues.append(result)
+
+        return VisualQAReport(
+            pdf_path=str(pdf),
+            fields_checked=checked,
+            field_issues=issues,
+            generated_at=datetime.now(timezone.utc),
+        )
+
+    def _pixel_white_ratio(
+        self,
+        samples: bytes,
+        pix_width: int,
+        px0: int, py0: int, px1: int, py1: int,
+        threshold: int = 240,
+        step: int = 3,
+    ) -> float:
+        """Return fraction of sampled pixels in the region that are near-white."""
+        white = 0
+        total = 0
+        n_samples = len(samples)
+        for py in range(py0, py1, step):
+            row = py * pix_width * 3
+            for px in range(px0, px1, step):
+                idx = row + px * 3
+                if idx + 2 >= n_samples:
+                    continue
+                r, g, b = samples[idx], samples[idx + 1], samples[idx + 2]
+                total += 1
+                if r >= threshold and g >= threshold and b >= threshold:
+                    white += 1
+        return white / max(total, 1)
+
+    def _pixel_check_text_field(
+        self,
+        alias: str,
+        field_name: str,
+        page_idx: int,
+        samples: bytes,
+        pix_width: int,
+        px0: int, py0: int, px1: int, py1: int,
+        expected_text: str,
+        field_width_pts: float,
+    ) -> VisualFieldResult:
+        white_ratio = self._pixel_white_ratio(samples, pix_width, px0, py0, px1, py1)
+
+        if expected_text and white_ratio > 0.97:
+            return VisualFieldResult(
+                alias=alias, field_name=field_name, page=page_idx,
+                status="possibly_empty",
+                message=(
+                    f"Field has stored value '{expected_text[:40]}' but the rendered "
+                    f"region is {white_ratio:.0%} white — value may be invisible "
+                    "(white text, rendering failure, or appearance-stream issue)."
+                ),
+                metadata={"white_ratio": round(white_ratio, 3), "check_method": "pixel"},
+            )
+
+        # Check right-edge pixel strip for content spilling past the field boundary
+        if expected_text and (px1 - px0) > 10:
+            edge_w = max(2, (px1 - px0) // 20)
+            edge_ratio = self._pixel_white_ratio(
+                samples, pix_width, px1 - edge_w, py0, px1, py1, threshold=200
+            )
+            if edge_ratio < 0.75 and len(expected_text) * 5.5 > field_width_pts:
+                return VisualFieldResult(
+                    alias=alias, field_name=field_name, page=page_idx,
+                    status="possible_overflow",
+                    message=(
+                        f"Dark pixels at right edge of '{field_name}' "
+                        f"({edge_ratio:.0%} non-white) — text may be clipped."
+                    ),
+                    metadata={"edge_white_ratio": round(edge_ratio, 3), "check_method": "pixel"},
+                )
+
+        return VisualFieldResult(alias=alias, field_name=field_name, page=page_idx, status="ok")
+
+    def _pixel_check_checkbox(
+        self,
+        alias: str,
+        field_name: str,
+        page_idx: int,
+        samples: bytes,
+        pix_width: int,
+        px0: int, py0: int, px1: int, py1: int,
+        expected_text: str,
+    ) -> VisualFieldResult:
+        expected_selected = expected_text.lower() not in {"off", "", "false", "0", "no"}
+        white_ratio = self._pixel_white_ratio(samples, pix_width, px0, py0, px1, py1)
+        # A checked checkbox should have non-white pixels (the checkmark)
+        visually_appears_checked = white_ratio < 0.80
+
+        if expected_selected and not visually_appears_checked:
+            return VisualFieldResult(
+                alias=alias, field_name=field_name, page=page_idx,
+                status="checkbox_mismatch",
+                message=(
+                    f"Checkbox should be checked but rendered region is "
+                    f"{white_ratio:.0%} white — check mark may be missing."
+                ),
+                metadata={"white_ratio": round(white_ratio, 3), "check_method": "pixel"},
+            )
+        if not expected_selected and visually_appears_checked:
+            return VisualFieldResult(
+                alias=alias, field_name=field_name, page=page_idx,
+                status="checkbox_mismatch",
+                message=(
+                    f"Checkbox should be unchecked but rendered region is only "
+                    f"{white_ratio:.0%} white — may appear checked."
+                ),
+                metadata={"white_ratio": round(white_ratio, 3), "check_method": "pixel"},
+            )
+
+        return VisualFieldResult(alias=alias, field_name=field_name, page=page_idx, status="ok")

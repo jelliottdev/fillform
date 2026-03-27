@@ -99,6 +99,7 @@ from .contracts import CanonicalField, CanonicalSchema
 from .field_alias import AliasMap, FieldAliasRegistry
 from .mcp_support import (
     PDF_BYTES_DESCRIPTION,
+    compute_pdf_fingerprint,
     create_session,
     get_session,
     pdf_source_properties,
@@ -643,10 +644,16 @@ async def _extract_fields(args: dict[str, Any]) -> list[TextContent | ImageConte
             },
         },
     }
+    try:
+        pdf_fingerprint = compute_pdf_fingerprint(pdf_path)
+        result["pdf_fingerprint"] = pdf_fingerprint
+    except Exception:
+        pdf_fingerprint = None
     if bool(args.get("persist_session", True)):
         session_id = create_session(
             pdf_path=pdf_path,
             alias_map=alias_map.alias_to_field,
+            pdf_fingerprint=pdf_fingerprint,
         )
         result["session_id"] = session_id
         result["session_expires_note"] = "In-memory session, valid while this MCP process is alive."
@@ -868,6 +875,16 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+    if session and session.get("pdf_fingerprint"):
+        try:
+            current_fp = compute_pdf_fingerprint(pdf_path)
+            if current_fp != session.get("pdf_fingerprint"):
+                return [TextContent(type="text", text=(
+                    "ERROR: session_id refers to a different PDF revision. "
+                    "Re-run extract_form_fields/analyze_form for this file."
+                ))]
+        except Exception:
+            pass
 
     output_pdf_path = Path(
         str(args.get("output_pdf_path") or (pdf_path.parent / f"{pdf_path.stem}_filled.pdf"))
@@ -931,6 +948,16 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         return [TextContent(type="text", text=f"ERROR: {exc}")]
     if not pdf_path.exists():
         return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+    if session and session.get("pdf_fingerprint"):
+        try:
+            current_fp = compute_pdf_fingerprint(pdf_path)
+            if current_fp != session.get("pdf_fingerprint"):
+                return [TextContent(type="text", text=(
+                    "ERROR: session_id refers to a different PDF revision. "
+                    "Re-run extract_form_fields/analyze_form for this file."
+                ))]
+        except Exception:
+            pass
 
     mode = str(args.get("mode") or "user_data").strip().lower()
     if mode not in {"user_data", "demo"}:
@@ -1008,10 +1035,16 @@ async def _complete_form(args: dict[str, Any]) -> list[TextContent | ImageConten
         3,
     )
     completion_is_complete = (not unresolved) and (not strict_validation or not logic_issues)
+    try:
+        source_fingerprint = compute_pdf_fingerprint(pdf_path)
+    except Exception:
+        source_fingerprint = None
+
     result = {
         "mode": mode,
         "source_pdf": str(pdf_path),
         "output_pdf": str(output_pdf_path),
+        "pdf_fingerprint": source_fingerprint,
         "fields_detected": len(alias_map.alias_to_field),
         "values_attempted": len(fill_values),
         "filled_successfully": sum(1 for status in fill_log.values() if status.startswith("ok:")),
@@ -1273,6 +1306,7 @@ def _workflow_guide() -> list[TextContent]:
             "If proxied mount path rewriting fails, pass pdf_bytes_base64 instead of pdf_path.",
             "pdf_path also accepts sandbox:/... and file://... path wrappers.",
             "Use session_id to avoid brittle handoffs when tools are called across separate turns.",
+            "Session calls verify PDF fingerprint to prevent accidental cross-document mapping reuse.",
             "Use alias_map_json when values_json keys are FXXX aliases.",
             "For best quality, use analyze_form and only manually review ambiguous_fields.",
             "Use fill_with_demo_data for the fastest demo-only path.",

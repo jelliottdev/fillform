@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import tempfile
 import uuid
 from pathlib import Path
@@ -30,11 +31,12 @@ def pdf_source_properties(path_description: str) -> dict[str, Any]:
 _analysis_sessions: dict[str, dict[str, Any]] = {}
 
 
-def create_session(pdf_path: Path, alias_map: dict[str, str]) -> str:
+def create_session(pdf_path: Path, alias_map: dict[str, str], pdf_fingerprint: str | None = None) -> str:
     session_id = str(uuid.uuid4())
     _analysis_sessions[session_id] = {
         "pdf_path": str(pdf_path),
         "alias_map": dict(alias_map),
+        "pdf_fingerprint": pdf_fingerprint,
     }
     if len(_analysis_sessions) > 100:
         for key in list(_analysis_sessions.keys())[:20]:
@@ -90,3 +92,14 @@ def _normalize_pdf_path(candidate: str) -> Path:
             return fallback
 
     return path
+
+
+def compute_pdf_fingerprint(pdf_path: Path) -> str:
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()

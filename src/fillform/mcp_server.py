@@ -1,4 +1,4 @@
-"""Tool-facing API surface for agents (MCP-oriented skeleton)."""
+"""Tool-facing API surface for agents (MCP-oriented service layer)."""
 
 from __future__ import annotations
 
@@ -39,11 +39,34 @@ class FillFormService:
         source_pdf: str | Path,
         schema: CanonicalSchema,
         payload: FillPayload,
+        output_pdf: str | Path | None = None,
     ) -> FillResult:
-        return self.fill_engine.fill(source_pdf, schema, payload)
+        """Fill *source_pdf* using *schema* + *payload*.
 
-    def verify_form(self, payload: FillPayload) -> VerificationReport:
-        return self.verification.verify(payload)
+        Parameters
+        ----------
+        output_pdf:
+            Destination path for the filled PDF.  When omitted the fill engine
+            writes to a temporary file.
+        """
+        return self.fill_engine.fill(source_pdf, schema, payload, output_pdf=output_pdf)
+
+    def verify_form(
+        self,
+        payload: FillPayload,
+        schema: CanonicalSchema | None = None,
+        filled_pdf: str | Path | None = None,
+    ) -> VerificationReport:
+        """Run multi-layer verification over a completed fill.
+
+        Parameters
+        ----------
+        schema:
+            Canonical schema used to check required-field coverage and formats.
+        filled_pdf:
+            Path to the output PDF for readback verification.
+        """
+        return self.verification.verify(payload=payload, schema=schema, filled_pdf=filled_pdf)
 
     # ------------------------------------------------------------------
     # Field-mapping pipeline
@@ -107,9 +130,7 @@ class FillFormService:
 
         # 3. Annotate PDF
         if annotated_output is None:
-            tmp = tempfile.NamedTemporaryFile(
-                suffix="_annotated.pdf", delete=False
-            )
+            tmp = tempfile.NamedTemporaryFile(suffix="_annotated.pdf", delete=False)
             tmp.close()
             annotated_path = Path(tmp.name)
         else:
@@ -127,4 +148,54 @@ class FillFormService:
             dpi=vision_dpi,
         )
 
+        # 5. Cache in registry
+        self.registry.put(schema)
+
         return schema, alias_map, annotated_path
+
+    # ------------------------------------------------------------------
+    # Convenience: analyze + fill + verify in one call
+    # ------------------------------------------------------------------
+
+    def analyze_fill_verify(
+        self,
+        pdf_path: str | Path,
+        payload: FillPayload,
+        form_family: str = "unknown",
+        version: str = "1",
+        output_pdf: str | Path | None = None,
+        vision_passes: int = 2,
+        vision_dpi: int = 150,
+    ) -> tuple[CanonicalSchema, FillResult, VerificationReport]:
+        """Full pipeline: analyze → fill → verify.
+
+        Returns
+        -------
+        (schema, fill_result, verification_report)
+        """
+        schema, _alias_map, annotated_path = self.analyze_form(
+            pdf_path=pdf_path,
+            form_family=form_family,
+            version=version,
+            vision_passes=vision_passes,
+            vision_dpi=vision_dpi,
+        )
+        try:
+            annotated_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        fill_result = self.fill_form(
+            source_pdf=pdf_path,
+            schema=schema,
+            payload=payload,
+            output_pdf=output_pdf,
+        )
+
+        report = self.verify_form(
+            payload=payload,
+            schema=schema,
+            filled_pdf=fill_result.flattened_pdf_path,
+        )
+
+        return schema, fill_result, report

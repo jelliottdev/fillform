@@ -41,7 +41,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import ImageContent, TextContent, Tool
 
 from fillform.annotator import PdfAnnotator
-from fillform.bankruptcy_forms import USCourtsBankruptcyFormsSync
+from fillform.bankruptcy_forms import BANKRUPTCY_INDEX_URL, USCourtsBankruptcyFormsSync
 from fillform.contracts import CanonicalField, CanonicalSchema
 from fillform.field_alias import FieldAliasRegistry
 from fillform.structure import PdfStructureService, PyMuPdfStructureAdapter, TextBlock
@@ -927,7 +927,7 @@ class _App:
                     except Exception:
                         manifest_path = None
                 if manifest_path is None:
-                    raise
+                    return self._index_catalogue_payload()
 
         forms = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path and manifest_path.exists() else {}
         rows = []
@@ -959,6 +959,36 @@ class _App:
         _analytics_cache["ts"] = now
         _analytics_cache["payload"] = dict(payload)
         return payload
+
+    def _index_catalogue_payload(self) -> dict[str, Any]:
+        """Fast fallback payload based only on the bankruptcy index page."""
+        syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=0.5)
+        html, _cache = syncer._get_text(BANKRUPTCY_INDEX_URL, {})
+        pages = syncer._extract_form_pages(html)
+        rows = [
+            {
+                "slug": syncer._slug_from_page(page_url),
+                "pdf_url": page_url,
+                "page_url": page_url,
+                "published_at": "",
+            }
+            for page_url in pages
+        ]
+        return {
+            "generated_at_unix": int(time.time()),
+            "counts": {
+                "forms_in_index": len(pages),
+                "pdf_records": len(rows),
+                "added": 0,
+                "removed": 0,
+                "changed": 0,
+            },
+            "added": [],
+            "removed": [],
+            "changed": [],
+            "forms": rows,
+            "source": "index_fallback",
+        }
 
     def _home_html(self, base_url: str) -> str:
         html = """<!doctype html>
@@ -998,18 +1028,22 @@ th{background:#fafafa;text-align:left}
 <table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'></tbody></table>
 <script>
 async function load(force){
-  const refresh = force ? '1' : '0';
-  const res=await fetch('/bankruptcy-analytics.json?refresh='+refresh,{cache:'no-store'});
-  const data=await res.json();
-  if(!data.ok){ document.getElementById('summary').textContent='Analytics error: '+(data.error||'unknown'); return; }
-  document.getElementById('summary').textContent=JSON.stringify(data.counts,null,2)+
-    "\\nAdded: "+data.added.join(', ')+"\\nChanged: "+data.changed.join(', ');
-  const rows=document.getElementById('rows'); rows.innerHTML='';
-  data.forms.forEach(f=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${f.slug}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
-    rows.appendChild(tr);
-  });
+  try{
+    const refresh = force ? '1' : '0';
+    const res=await fetch('/bankruptcy-analytics.json?refresh='+refresh,{cache:'no-store'});
+    const data=await res.json();
+    if(!data.ok){ document.getElementById('summary').textContent='Analytics error: '+(data.error||'unknown'); return; }
+    document.getElementById('summary').textContent=JSON.stringify(data.counts,null,2)+
+      "\\nAdded: "+data.added.join(', ')+"\\nChanged: "+data.changed.join(', ');
+    const rows=document.getElementById('rows'); rows.innerHTML='';
+    data.forms.forEach(f=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${f.slug}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
+      rows.appendChild(tr);
+    });
+  }catch(err){
+    document.getElementById('summary').textContent='Analytics request failed: '+String(err);
+  }
 }
 load(false);
 </script></body></html>"""

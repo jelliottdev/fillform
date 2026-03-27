@@ -850,6 +850,21 @@ def _render_pages(pdf_path: Path, dpi: int = 72) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class _App:
+    def _header_map(self, scope) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in scope.get("headers", []):
+            try:
+                out[k.decode("latin-1").lower()] = v.decode("latin-1")
+            except Exception:
+                continue
+        return out
+
+    def _base_url(self, scope) -> str:
+        headers = self._header_map(scope)
+        proto = headers.get("x-forwarded-proto") or scope.get("scheme") or "https"
+        host = headers.get("x-forwarded-host") or headers.get("host") or "localhost"
+        return f"{proto}://{host}"
+
     async def _send_json(self, send, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
         await send(
@@ -914,8 +929,8 @@ class _App:
         _analytics_cache["payload"] = dict(payload)
         return payload
 
-    def _home_html(self) -> str:
-        return """<!doctype html>
+    def _home_html(self, base_url: str) -> str:
+        html = """<!doctype html>
 <html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/>
 <title>FillForm Bankruptcy MCP</title>
 <style>
@@ -931,11 +946,11 @@ th{background:#fafafa;text-align:left}
 <p class='muted'>Simple Vercel landing page with MCP setup + live bankruptcy form analytics.</p>
 <h2>1) MCP Setup</h2>
 <p>Use this URL for your MCP server:</p>
-<pre><code>https://YOUR-VERCEL-DOMAIN.vercel.app</code></pre>
+<pre><code>__BASE_URL__</code></pre>
 <p>Claude settings snippet:</p>
 <pre><code>{
   "mcpServers": {
-    "fillform": { "url": "https://YOUR-VERCEL-DOMAIN.vercel.app" }
+    "fillform": { "url": "__BASE_URL__" }
   }
 }</code></pre>
 <h2>2) Tutorial — Get any bankruptcy doc</h2>
@@ -965,6 +980,7 @@ async function load(){
 }
 load();
 </script></body></html>"""
+        return html.replace("__BASE_URL__", base_url)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
@@ -976,7 +992,7 @@ load();
         path = scope.get("path", "/")
         if scope.get("method") == "GET":
             if path in ("/", "/index.html"):
-                await self._send_html(send, self._home_html(), status=200)
+                await self._send_html(send, self._home_html(self._base_url(scope)), status=200)
                 return
             if path == "/bankruptcy-analytics.json":
                 try:

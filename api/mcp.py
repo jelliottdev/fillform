@@ -31,6 +31,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import parse_qs
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parent / "src"))
@@ -886,19 +887,49 @@ class _App:
         )
         await send({"type": "http.response.body", "body": html.encode("utf-8")})
 
-    def _analytics_payload(self) -> dict[str, Any]:
+    def _analytics_payload(self, refresh: bool = False) -> dict[str, Any]:
         now = int(time.time())
         cached_payload = _analytics_cache.get("payload")
         cached_ts = int(_analytics_cache.get("ts", 0) or 0)
-        if cached_payload and (now - cached_ts) < _ANALYTICS_TTL_SECONDS:
+        if (not refresh) and cached_payload and (now - cached_ts) < _ANALYTICS_TTL_SECONDS:
             return dict(cached_payload)
 
         state_path = Path("/tmp/fillform_bankruptcy_state.json")
         out_dir = Path("/tmp/fillform_bankruptcy_forms")
-        syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
-        result = syncer.sync(output_dir=out_dir, state_path=state_path, download_pdfs=False)
-        manifest_path = Path(result.manifest_path)
-        forms = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        manifest_path: Path | None = None
+        result = None
+
+        if (not refresh) and state_path.exists():
+            try:
+                state_obj = json.loads(state_path.read_text(encoding="utf-8"))
+                latest = state_obj.get("latest_manifest_path")
+                if latest:
+                    candidate = Path(str(latest))
+                    if candidate.exists():
+                        manifest_path = candidate
+            except Exception:
+                manifest_path = None
+
+        if manifest_path is None:
+            syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=1.5)
+            try:
+                result = syncer.sync(output_dir=out_dir, state_path=state_path, download_pdfs=False)
+                manifest_path = Path(result.manifest_path)
+            except Exception:
+                if state_path.exists():
+                    try:
+                        state_obj = json.loads(state_path.read_text(encoding="utf-8"))
+                        latest = state_obj.get("latest_manifest_path")
+                        if latest:
+                            candidate = Path(str(latest))
+                            if candidate.exists():
+                                manifest_path = candidate
+                    except Exception:
+                        manifest_path = None
+                if manifest_path is None:
+                    raise
+
+        forms = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path and manifest_path.exists() else {}
         rows = []
         for slug, record in sorted(forms.items()):
             if not isinstance(record, dict):
@@ -914,15 +945,15 @@ class _App:
         payload = {
             "generated_at_unix": int(time.time()),
             "counts": {
-                "forms_in_index": result.total_index_forms,
-                "pdf_records": result.total_pdf_forms,
-                "added": len(result.added),
-                "removed": len(result.removed),
-                "changed": len(result.changed),
+                "forms_in_index": (result.total_index_forms if result else None),
+                "pdf_records": len(rows),
+                "added": (len(result.added) if result else 0),
+                "removed": (len(result.removed) if result else 0),
+                "changed": (len(result.changed) if result else 0),
             },
-            "added": result.added,
-            "removed": result.removed,
-            "changed": result.changed,
+            "added": (result.added if result else []),
+            "removed": (result.removed if result else []),
+            "changed": (result.changed if result else []),
             "forms": rows,
         }
         _analytics_cache["ts"] = now
@@ -962,23 +993,25 @@ th{background:#fafafa;text-align:left}
 </ol>
 <h2>3) Live bankruptcy form analytics</h2>
 <p class='muted'>This checks USCourts, computes diffs, and shows publish headers when available (cached up to 5 minutes).</p>
-<button onclick='load()'>Refresh analytics</button>
+<button onclick='load(true)'>Refresh analytics</button>
 <pre id='summary'>Loading…</pre>
 <table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'></tbody></table>
 <script>
-async function load(){
-  const res=await fetch('/bankruptcy-analytics.json',{cache:'no-store'});
+async function load(force){
+  const refresh = force ? '1' : '0';
+  const res=await fetch('/bankruptcy-analytics.json?refresh='+refresh,{cache:'no-store'});
   const data=await res.json();
+  if(!data.ok){ document.getElementById('summary').textContent='Analytics error: '+(data.error||'unknown'); return; }
   document.getElementById('summary').textContent=JSON.stringify(data.counts,null,2)+
     "\\nAdded: "+data.added.join(', ')+"\\nChanged: "+data.changed.join(', ');
   const rows=document.getElementById('rows'); rows.innerHTML='';
-  data.forms.slice(0,250).forEach(f=>{
+  data.forms.forEach(f=>{
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${f.slug}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
     rows.appendChild(tr);
   });
 }
-load();
+load(false);
 </script></body></html>"""
         return html.replace("__BASE_URL__", base_url)
 
@@ -995,8 +1028,10 @@ load();
                 await self._send_html(send, self._home_html(self._base_url(scope)), status=200)
                 return
             if path == "/bankruptcy-analytics.json":
+                query = parse_qs((scope.get("query_string") or b"").decode("utf-8", "ignore"))
+                refresh = str((query.get("refresh") or ["0"])[0]).lower() in ("1", "true", "yes")
                 try:
-                    payload = self._analytics_payload()
+                    payload = self._analytics_payload(refresh=refresh)
                 except Exception as exc:
                     await self._send_json(send, {"ok": False, "error": str(exc)}, status=502)
                     return

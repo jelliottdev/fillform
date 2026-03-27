@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import CanonicalSchema, FillPayload, FillWriteAction
+from .repeating_sections import ExpansionResult, RepeatingSectionExpander
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,7 @@ class FillResult:
     fill_log: dict[str, str]
     write_actions: list[FillWriteAction] = field(default_factory=list)
     changed_fields: list[dict[str, str]] = field(default_factory=list)
+    repeating_expansion: ExpansionResult | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +209,13 @@ class FillEngine:
         # Build alias → field_name from schema
         alias_to_field: dict[str, str] = {f.alias: f.field_name for f in schema.fields}
 
+        # Expand repeating-section rows into flat field → value pairs
+        expansion: ExpansionResult | None = None
+        extra_flat: dict[str, Any] = {}
+        if schema.repeating_sections and payload.repeating_values:
+            expansion = RepeatingSectionExpander().expand(schema, payload)
+            extra_flat = expansion.flat_values
+
         fill_log: dict[str, str] = {}
         changed_fields: list[dict[str, str]] = []
         write_actions: list[FillWriteAction] = []
@@ -225,6 +234,9 @@ class FillEngine:
             for key, raw_value in payload.values.items():
                 field_name = alias_to_field.get(str(key), str(key))
                 resolved.append((str(key), field_name, raw_value))
+            # Append expanded repeating-section entries (already use PDF field names)
+            for pdf_field_name, raw_value in extra_flat.items():
+                resolved.append((pdf_field_name, pdf_field_name, raw_value))
 
             for key_str, field_name, raw_value in resolved:
                 widgets = widgets_by_name.get(field_name) or []
@@ -299,4 +311,5 @@ class FillEngine:
             fill_log=fill_log,
             write_actions=write_actions,
             changed_fields=changed_fields,
+            repeating_expansion=expansion,
         )

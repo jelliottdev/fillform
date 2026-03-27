@@ -28,6 +28,7 @@ from .contracts import (
     VerificationCheck,
     VerificationReport,
 )
+from .repeating_sections import RepeatingSectionExpander
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,13 @@ class VerificationEngine:
             if constraint_check is not None:
                 checks.append(constraint_check)
 
-        # ── 5. Arithmetic / cross-field totals ────────────────────────────
+        # ── 5. Repeating section completeness ─────────────────────────────
+        if schema is not None and schema.repeating_sections:
+            rep_check = self._repeating_section_check(payload=payload, schema=schema)
+            if rep_check is not None:
+                checks.append(rep_check)
+
+        # ── 6. Arithmetic / cross-field totals ────────────────────────────
         if schema is not None:
             arith_check = self._arithmetic_check(payload=payload, schema=schema)
             if arith_check is not None:
@@ -640,6 +647,122 @@ class VerificationEngine:
             message=f"{len(issues)} constraint violation(s) detected.",
             issues=issues,
             metadata={"issue_count": len(issues)},
+        )
+
+    def _repeating_section_check(
+        self,
+        payload: FillPayload,
+        schema: CanonicalSchema,
+    ) -> VerificationCheck | None:
+        """Validate repeating sections: min_rows, required columns, and overflow.
+
+        Returns None when no repeating sections are declared.
+        """
+        if not schema.repeating_sections:
+            return None
+
+        issues: list[ValidationIssue] = []
+        overflow_warnings: list[str] = []
+
+        # Expand to detect overflow and undersized sections
+        expansion = RepeatingSectionExpander().expand(schema, payload)
+
+        for section in schema.repeating_sections:
+            rows = payload.repeating_values.get(section.section_id) or []
+            row_count = len(rows)
+
+            # min_rows violation
+            if section.min_rows > 0 and row_count < section.min_rows:
+                issues.append(ValidationIssue(
+                    field=section.section_id,
+                    rule="repeating_section_min_rows",
+                    severity="error",
+                    message=(
+                        f"Section '{section.label}' requires at least "
+                        f"{section.min_rows} row(s) but {row_count} were provided."
+                    ),
+                    metadata={
+                        "section_id": section.section_id,
+                        "min_rows": section.min_rows,
+                        "rows_provided": row_count,
+                    },
+                ))
+
+            # Required columns within each row
+            for row_idx, row_data in enumerate(rows):
+                if not isinstance(row_data, dict):
+                    continue
+                for sec_field in section.fields:
+                    if not sec_field.is_required:
+                        continue
+                    value = row_data.get(sec_field.local_alias)
+                    if value is None or str(value).strip() == "":
+                        issues.append(ValidationIssue(
+                            field=f"{section.section_id}[{row_idx}].{sec_field.local_alias}",
+                            rule="repeating_section_required_column",
+                            severity="error",
+                            message=(
+                                f"Row {row_idx + 1} of '{section.label}': "
+                                f"required column '{sec_field.local_alias}' is missing or empty."
+                            ),
+                            metadata={
+                                "section_id": section.section_id,
+                                "row_index": row_idx,
+                                "column": sec_field.local_alias,
+                            },
+                        ))
+
+        # Overflow warnings
+        for ov in expansion.overflow:
+            cont = f" Use '{ov.continuation_form}' for overflow." if ov.continuation_form else ""
+            overflow_warnings.append(
+                f"Section '{ov.section_label}': {ov.count} row(s) exceed max_rows.{cont}"
+            )
+            issues.append(ValidationIssue(
+                field=ov.section_id,
+                rule="repeating_section_overflow",
+                severity="warning",
+                message=overflow_warnings[-1],
+                metadata={
+                    "section_id": ov.section_id,
+                    "overflow_count": ov.count,
+                    "continuation_form": ov.continuation_form,
+                },
+            ))
+
+        if not issues:
+            total_rows = sum(
+                len(payload.repeating_values.get(s.section_id) or [])
+                for s in schema.repeating_sections
+            )
+            return VerificationCheck(
+                check_id="repeating_sections",
+                status="passed",
+                category="completeness",
+                message=(
+                    f"All {len(schema.repeating_sections)} repeating section(s) passed "
+                    f"({total_rows} total row(s))."
+                ),
+                metadata={
+                    "section_count": len(schema.repeating_sections),
+                    "total_rows": total_rows,
+                },
+            )
+
+        errors = [i for i in issues if i.severity == "error"]
+        return VerificationCheck(
+            check_id="repeating_sections",
+            status="failed" if errors else "passed",
+            category="completeness",
+            message=(
+                f"{len(errors)} error(s) and {len(issues) - len(errors)} warning(s) "
+                "in repeating sections."
+            ),
+            issues=issues,
+            metadata={
+                "error_count": len(errors),
+                "warning_count": len(issues) - len(errors),
+            },
         )
 
     def _arithmetic_check(

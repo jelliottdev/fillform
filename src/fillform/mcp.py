@@ -314,6 +314,16 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional: session_id returned by extract_form_fields/analyze_form.",
                     },
+                    "repeating_values_json": {
+                        "description": (
+                            "Optional row data for repeating sections (creditor lists, "
+                            "income rows, etc.). Accepts a JSON string or object keyed by "
+                            "section_id, where each value is a list of row objects. "
+                            "Example: {\"creditors\": [{\"name\": \"Bank A\", \"amount\": \"15000\"}]}. "
+                            "Requires the schema to have repeating_sections defined."
+                        ),
+                        "oneOf": [{"type": "string"}, {"type": "object"}],
+                    },
                     "output_pdf_path": {
                         "type": "string",
                         "description": (
@@ -662,6 +672,27 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="detect_repeating_slots",
+            description=(
+                "Heuristic analysis of a PDF's AcroForm field names to detect likely "
+                "repeating-section grids (creditor rows, income rows, etc.). "
+                "Returns slot groups with PDF field name templates suitable for use "
+                "in RepeatingSection schema definitions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **pdf_source_properties("Absolute path to the PDF to analyse."),
+                    "min_repetitions": {
+                        "type": "integer",
+                        "description": "Minimum number of matching fields to form a group. Default 2.",
+                        "default": 2,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="packet_validate",
             description=(
                 "Validate cross-form consistency for a Chapter 7 or Chapter 13 "
@@ -753,6 +784,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         return await _quality_report(arguments)
     if name == "schema_diff":
         return await _schema_diff(arguments)
+    if name == "detect_repeating_slots":
+        return await _detect_repeating_slots(arguments)
     if name == "packet_validate":
         return await _packet_validate(arguments)
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1101,6 +1134,76 @@ async def _fill_pdf_form(args: dict[str, Any]) -> list[TextContent]:
         import fitz
     except ImportError as exc:
         return [TextContent(type="text", text=f"ERROR: PyMuPDF (fitz) is required: {exc}")]
+
+    # Schema-aware path: use FillEngine when schema_json provided (required for
+    # repeating_values_json support and constraint-aware filling).
+    if args.get("schema_json") or args.get("repeating_values_json"):
+        from .contracts import CanonicalSchema, FillPayload
+        from .fill_engine import FillEngine
+
+        schema_raw = None
+        if args.get("schema_json"):
+            try:
+                schema_raw = _coerce_json_object(args.get("schema_json"), "schema_json")
+            except ValueError as exc:
+                return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+        if schema_raw is None:
+            return [TextContent(type="text", text=(
+                "ERROR: schema_json is required when repeating_values_json is provided."
+            ))]
+
+        try:
+            schema = CanonicalSchema.from_dict(schema_raw)
+        except Exception as exc:
+            return [TextContent(type="text", text=f"ERROR parsing schema: {exc}")]
+
+        repeating_values: dict[str, list] = {}
+        if args.get("repeating_values_json"):
+            try:
+                repeating_values = _coerce_json_object(
+                    args.get("repeating_values_json"), "repeating_values_json"
+                )
+            except ValueError as exc:
+                return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+        payload = FillPayload(
+            schema_family=schema.form_family,
+            schema_version=schema.version,
+            values=values,
+            repeating_values=repeating_values,
+        )
+
+        engine = FillEngine()
+        try:
+            fill_result = engine.fill(
+                source_pdf=pdf_path,
+                schema=schema,
+                payload=payload,
+                output_pdf=output_pdf_path,
+            )
+        except Exception as exc:
+            return [TextContent(type="text", text=f"ERROR during fill: {exc}")]
+
+        expansion_summary = (
+            fill_result.repeating_expansion.to_dict()
+            if fill_result.repeating_expansion else None
+        )
+        return [TextContent(type="text", text=json.dumps(
+            {
+                "source_pdf": str(pdf_path),
+                "output_pdf": str(output_pdf_path),
+                "filled": sum(1 for v in fill_result.fill_log.values() if v.startswith("ok:")),
+                "total_values": len(values) + len(
+                    fill_result.repeating_expansion.flat_values
+                    if fill_result.repeating_expansion else {}
+                ),
+                "fill_log": fill_result.fill_log,
+                "changed_fields": fill_result.changed_fields,
+                "repeating_expansion": expansion_summary,
+            },
+            indent=2,
+        ))]
 
     fill_report = _fill_pdf_document_report(
         pdf_path=pdf_path,
@@ -2505,6 +2608,67 @@ async def _schema_diff(args: dict[str, Any]) -> list[TextContent]:
             "add_required": sum(1 for a in plan if a.kind == "add_required"),
         }
 
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+async def _detect_repeating_slots(args: dict[str, Any]) -> list[TextContent]:
+    from .repeating_sections import detect_repeating_slots
+
+    try:
+        pdf_path = resolve_pdf_source(args)
+    except ValueError as exc:
+        return [TextContent(type="text", text=f"ERROR: {exc}")]
+
+    if not pdf_path.exists():
+        return [TextContent(type="text", text=f"ERROR: File not found: {pdf_path}")]
+
+    min_reps = int(args.get("min_repetitions", 2))
+
+    try:
+        structure = _structure_service.extract(pdf_path)
+    except Exception as exc:
+        return [TextContent(type="text", text=f"ERROR extracting structure: {exc}")]
+
+    field_names = [w.field_name for w in structure.field_widgets if w.field_name]
+    if not field_names:
+        return [TextContent(type="text", text=json.dumps({
+            "field_count": 0,
+            "groups": [],
+            "message": "No AcroForm fields found.",
+        }, indent=2))]
+
+    groups = detect_repeating_slots(field_names, min_repetitions=min_reps)
+
+    # Build suggested RepeatingSection schema fragments
+    suggestions: list[dict] = []
+    for grp in groups:
+        suggestions.append({
+            "detected_group": grp.to_dict(),
+            "suggested_repeating_section": {
+                "section_id": re.sub(r"[^a-z0-9_]", "_", grp.base_name.lower()),
+                "label": grp.base_name.replace("_", " ").title(),
+                "max_rows": grp.row_count,
+                "fields": [
+                    {
+                        "local_alias": "value",
+                        "pdf_field_template": grp.template,
+                        "label": grp.base_name,
+                    }
+                ],
+            },
+        })
+
+    result = {
+        "pdf": pdf_path.name,
+        "total_fields": len(field_names),
+        "groups_detected": len(groups),
+        "groups": suggestions,
+        "hint": (
+            "Use suggested_repeating_section as a starting point for "
+            "RepeatingSection entries in your CanonicalSchema. "
+            "Refine local_alias names and split multi-column groups manually."
+        ),
+    }
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 

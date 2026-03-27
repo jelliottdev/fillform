@@ -120,6 +120,120 @@ class CanonicalField:
 
 
 @dataclass(frozen=True)
+class RepeatingSectionField:
+    """Template for a single logical field within a :class:`RepeatingSection`.
+
+    Each row of the section produces one value per ``RepeatingSectionField``.
+    The actual PDF field name for row *n* is obtained by substituting ``{row}``
+    (0-based) into :attr:`pdf_field_template`.
+
+    Example — a creditor section with three columns::
+
+        RepeatingSectionField(local_alias="name",    pdf_field_template="creditor_{row}_name")
+        RepeatingSectionField(local_alias="amount",  pdf_field_template="creditor_{row}_amount")
+        RepeatingSectionField(local_alias="account", pdf_field_template="creditor_{row}_acct")
+    """
+
+    local_alias: str                    # Short name within the section (e.g. "name")
+    pdf_field_template: str             # PDF field name template; {row} is the 0-based row index
+    label: str | None = None
+    expected_value_type: str | None = None   # string | date | number | boolean
+    expected_format: str | None = None
+    is_required: bool = False           # Required within each row
+    constraints: tuple[FieldConstraint, ...] = ()
+
+    def pdf_field_name(self, row: int) -> str:
+        """Return the concrete PDF field name for the given 0-based *row*."""
+        return self.pdf_field_template.replace("{row}", str(row))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "local_alias": self.local_alias,
+            "pdf_field_template": self.pdf_field_template,
+            "label": self.label,
+            "expected_value_type": self.expected_value_type,
+            "expected_format": self.expected_format,
+            "is_required": self.is_required,
+            "constraints": [c.to_dict() for c in self.constraints],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RepeatingSectionField":
+        return cls(
+            local_alias=str(payload["local_alias"]),
+            pdf_field_template=str(payload["pdf_field_template"]),
+            label=payload.get("label"),
+            expected_value_type=payload.get("expected_value_type"),
+            expected_format=payload.get("expected_format"),
+            is_required=bool(payload.get("is_required", False)),
+            constraints=tuple(
+                FieldConstraint.from_dict(c) for c in payload.get("constraints") or []
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class RepeatingSection:
+    """A variable-length group of fields that can appear 0-N times in a form.
+
+    Common uses
+    -----------
+    - Creditor rows on Schedule D/E/F
+    - Income source rows on Schedule I
+    - Expense rows on Schedule J
+    - Asset rows on Schedule A/B
+
+    Overflow model
+    --------------
+    When the payload contains more rows than ``max_rows`` allows,
+    :attr:`continuation_form` names the form family that should receive the
+    overflow rows.  The fill engine raises an ``OverflowWarning`` rather than
+    silently dropping rows.
+    """
+
+    section_id: str                     # Unique ID within the schema (e.g. "creditors")
+    label: str                          # Human-readable section name
+    fields: tuple[RepeatingSectionField, ...]
+    min_rows: int = 0                   # Minimum rows required (0 = optional)
+    max_rows: int | None = None         # Max rows on this page (None = unlimited)
+    continuation_form: str | None = None  # Form family for overflow rows
+
+    def field_names_for_row(self, row: int) -> dict[str, str]:
+        """Return ``{local_alias: pdf_field_name}`` for the given 0-based row."""
+        return {f.local_alias: f.pdf_field_name(row) for f in self.fields}
+
+    def all_pdf_field_names(self, num_rows: int) -> list[str]:
+        """Return every PDF field name that would be written for *num_rows* rows."""
+        names: list[str] = []
+        for row in range(num_rows):
+            names.extend(f.pdf_field_name(row) for f in self.fields)
+        return names
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "section_id": self.section_id,
+            "label": self.label,
+            "fields": [f.to_dict() for f in self.fields],
+            "min_rows": self.min_rows,
+            "max_rows": self.max_rows,
+            "continuation_form": self.continuation_form,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RepeatingSection":
+        return cls(
+            section_id=str(payload["section_id"]),
+            label=str(payload["label"]),
+            fields=tuple(
+                RepeatingSectionField.from_dict(f) for f in payload.get("fields") or []
+            ),
+            min_rows=int(payload.get("min_rows", 0)),
+            max_rows=int(payload["max_rows"]) if payload.get("max_rows") is not None else None,
+            continuation_form=payload.get("continuation_form"),
+        )
+
+
+@dataclass(frozen=True)
 class CanonicalSchema:
     """Complete semantic mapping of all fields in a PDF form."""
 
@@ -127,6 +241,7 @@ class CanonicalSchema:
     version: str
     mode: str                           # acroform | overlay | hybrid
     fields: list[CanonicalField] = field(default_factory=list)
+    repeating_sections: tuple[RepeatingSection, ...] = ()
 
     @property
     def alias_map(self) -> dict[str, str]:
@@ -139,6 +254,7 @@ class CanonicalSchema:
             "version": self.version,
             "mode": self.mode,
             "fields": [f.to_dict() for f in self.fields],
+            "repeating_sections": [s.to_dict() for s in self.repeating_sections],
         }
 
     @classmethod
@@ -148,6 +264,10 @@ class CanonicalSchema:
             version=str(payload["version"]),
             mode=str(payload["mode"]),
             fields=[CanonicalField.from_dict(f) for f in payload.get("fields", [])],
+            repeating_sections=tuple(
+                RepeatingSection.from_dict(s)
+                for s in payload.get("repeating_sections") or []
+            ),
         )
 
     def to_fill_script(self) -> str:
@@ -219,6 +339,30 @@ class CanonicalSchema:
         else:
             lines.append("*(none)*")
 
+        if self.repeating_sections:
+            lines += [
+                "",
+                "---",
+                "",
+                "## Repeating Sections",
+                "",
+                "Pass row data via `repeating_values` keyed by `section_id`.",
+                "",
+            ]
+            for sec in self.repeating_sections:
+                min_label = f"min {sec.min_rows}" if sec.min_rows else "optional"
+                max_label = f"max {sec.max_rows}" if sec.max_rows else "unlimited"
+                overflow = f"  →  overflow: `{sec.continuation_form}`" if sec.continuation_form else ""
+                lines.append(f"### `{sec.section_id}` — {sec.label}  ({min_label}, {max_label}){overflow}")
+                lines.append("")
+                lines.append("| Column | PDF field template | Type | Req |")
+                lines.append("|--------|--------------------|------|-----|")
+                for sf in sec.fields:
+                    req = "Y" if sf.is_required else "N"
+                    vtype = sf.expected_value_type or "string"
+                    lines.append(f"| `{sf.local_alias}` | `{sf.pdf_field_template}` | {vtype} | {req} |")
+                lines.append("")
+
         lines += [
             "",
             "---",
@@ -243,20 +387,33 @@ class FillPayload:
     schema_version: str
     # Values keyed by alias (F001) or raw field name — fill engine resolves both.
     values: dict[str, Any] = field(default_factory=dict)
+    # Row data for repeating sections, keyed by section_id.
+    # Each entry is a list of rows; each row is {local_alias: value}.
+    # Example: {"creditors": [{"name": "Bank A", "amount": "15000.00"}, ...]}
+    repeating_values: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_family": self.schema_family,
             "schema_version": self.schema_version,
             "values": dict(self.values),
+            "repeating_values": {
+                k: [dict(row) for row in rows]
+                for k, rows in self.repeating_values.items()
+            },
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FillPayload":
+        raw_repeating = payload.get("repeating_values") or {}
         return cls(
             schema_family=str(payload["schema_family"]),
             schema_version=str(payload["schema_version"]),
             values=dict(payload.get("values") or {}),
+            repeating_values={
+                str(k): [dict(row) for row in rows]
+                for k, rows in raw_repeating.items()
+            },
         )
 
 

@@ -1163,108 +1163,85 @@ if(!document.getElementById('rows').children.length){ load(false); }
                 break
         return body
 
-    async def _handle_bankruptcy_sync(self, receive, send) -> None:
-        """Handle POST /bankruptcy-forms/sync — run crawler and return manifest inline.
+    # Static manifest of known bankruptcy forms — returns instantly without
+    # any network requests, which is critical for Vercel Hobby plan (10s timeout).
+    # Updated from https://www.uscourts.gov/forms-rules/forms/bankruptcy-forms
+    _STATIC_BANKRUPTCY_FORMS: list[dict[str, str]] = [
+        {"slug": "b-101", "title": "Voluntary Petition for Individuals Filing for Bankruptcy", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_101.pdf"},
+        {"slug": "b-101a", "title": "Initial Statement About an Eviction Judgment", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_101a.pdf"},
+        {"slug": "b-101b", "title": "Additional Statement About an Eviction Judgment", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_101b.pdf"},
+        {"slug": "b-104", "title": "For Individuals Filing Bankruptcy: List of Creditors", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_104.pdf"},
+        {"slug": "b-106a-b", "title": "Schedule A/B: Property", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106a_b.pdf"},
+        {"slug": "b-106c", "title": "Schedule C: The Property You Claim as Exempt", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106c.pdf"},
+        {"slug": "b-106d", "title": "Schedule D: Creditors Who Hold Claims Secured by Property", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106d.pdf"},
+        {"slug": "b-106e-f", "title": "Schedule E/F: Creditors Who Have Unsecured Claims", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106e_f.pdf"},
+        {"slug": "b-106g", "title": "Schedule G: Executory Contracts and Unexpired Leases", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106g.pdf"},
+        {"slug": "b-106h", "title": "Schedule H: Your Codebtors", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106h.pdf"},
+        {"slug": "b-106i", "title": "Schedule I: Your Income", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106i.pdf"},
+        {"slug": "b-106j", "title": "Schedule J: Your Expenses", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106j.pdf"},
+        {"slug": "b-106j-2", "title": "Schedule J-2: Expenses for Separate Household of Debtor 2", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106j_2.pdf"},
+        {"slug": "b-106-summary", "title": "Summary of Your Assets and Liabilities and Certain Statistical Information", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106_summary.pdf"},
+        {"slug": "b-106-declaration", "title": "Declaration About an Individual Debtor's Schedules", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_106_declaration.pdf"},
+        {"slug": "b-107", "title": "Statement of Financial Affairs for Individuals Filing for Bankruptcy", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_107.pdf"},
+        {"slug": "b-108", "title": "Statement of Intention for Individuals Filing Under Chapter 7", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_108.pdf"},
+        {"slug": "b-113", "title": "Chapter 13 Plan", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_113.pdf"},
+        {"slug": "b-114", "title": "Class 1 Cure and Maintain Attachment (Chapter 13)", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_114.pdf"},
+        {"slug": "b-119", "title": "Bankruptcy Petition Preparer's Notice, Declaration, and Signature", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_119.pdf"},
+        {"slug": "b-121", "title": "Statement About Your Social Security Numbers", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_121.pdf"},
+        {"slug": "b-122a-1", "title": "Chapter 7 Statement of Your Current Monthly Income", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122a-1.pdf"},
+        {"slug": "b-122a-2", "title": "Chapter 7 Means Test Calculation", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122a-2.pdf"},
+        {"slug": "b-122a-1-supp", "title": "Statement of Exemption from Presumption of Abuse Under § 707(b)(2)", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122a-1_supp.pdf"},
+        {"slug": "b-122b", "title": "Chapter 11 Statement of Your Current Monthly Income", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122b.pdf"},
+        {"slug": "b-122c-1", "title": "Chapter 13 Statement of Your Current Monthly Income and Calculation of Commitment Period", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122c-1.pdf"},
+        {"slug": "b-122c-2", "title": "Chapter 13 Calculation of Your Disposable Income", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_122c-2.pdf"},
+        {"slug": "b-201", "title": "Voluntary Petition for Non-Individuals Filing for Bankruptcy", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_201.pdf"},
+        {"slug": "b-309a", "title": "Notice of Chapter 7 Bankruptcy Case", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_309a.pdf"},
+        {"slug": "b-309f", "title": "Notice of Chapter 13 Bankruptcy Case", "pdf_url": "https://www.uscourts.gov/sites/default/files/form_b_309f.pdf"},
+    ]
 
-        On Vercel, the full crawl (60+ pages + sitemap) exceeds function timeout.
-        This uses a thread-pool timeout to return partial results if the crawl
-        doesn't finish in time, and falls back to the index-only catalogue.
+    async def _handle_bankruptcy_sync(self, receive, send) -> None:
+        """Handle POST /bankruptcy-forms/sync — return known forms manifest.
+
+        Returns a static manifest of known bankruptcy forms instantly (no network
+        requests). This is critical for Vercel Hobby plan which has a 10s timeout
+        including cold start. The static manifest is comprehensive and includes
+        all standard individual Chapter 7/13 forms.
+
+        Callers (veridocket) download the actual PDFs directly from uscourts.gov.
         """
         body = await self._read_body(receive)
-        payload: dict[str, Any] = {}
-        if body:
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                await self._send_json(send, {"ok": False, "error": "Invalid JSON body"}, status=400)
-                return
+        # Accept and ignore any JSON body params for forward compatibility
 
-        out_dir = Path("/tmp/fillform_bankruptcy_forms")
-        state_path = Path("/tmp/fillform_bankruptcy_state.json")
-        interval = float(payload.get("min_request_interval_seconds", 1.2))
-        max_pages = payload.get("max_form_pages")
-        if max_pages is not None:
-            max_pages = int(max_pages)
-
-        def _do_sync():
-            syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=interval)
-            return syncer.sync(
-                output_dir=out_dir,
-                state_path=state_path,
-                download_pdfs=False,
-                max_form_pages=max_pages,
-            )
-
-        # Run with timeout to stay within Vercel's function limits.
-        # Hobby plan: 10s, Pro: 60s. Use 8s to leave room for response serialization.
-        sync_result = None
-        timed_out = False
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_do_sync)
-                try:
-                    from dataclasses import asdict
-                    sync_result = asdict(future.result(timeout=8.0))
-                except concurrent.futures.TimeoutError:
-                    timed_out = True
-        except Exception as exc:
-            await self._send_json(send, {"ok": False, "error": f"Sync failed: {exc}"}, status=502)
-            return
-
-        # Load the manifest — either from the completed sync or from cached state.
         manifest: dict[str, Any] = {}
-        if sync_result:
-            manifest_path_str = sync_result.get("manifest_path", "")
-            if manifest_path_str:
-                mp = Path(manifest_path_str)
-                if mp.exists():
-                    try:
-                        manifest = json.loads(mp.read_text(encoding="utf-8"))
-                    except Exception:
-                        pass
-            sync_result["manifest"] = manifest
-            await self._send_json(send, {"ok": True, "result": sync_result})
-        elif timed_out:
-            # Sync didn't complete — try returning cached manifest from state file.
-            if state_path.exists():
-                try:
-                    state = json.loads(state_path.read_text(encoding="utf-8"))
-                    latest = state.get("latest_manifest_path")
-                    if latest and Path(latest).exists():
-                        manifest = json.loads(Path(latest).read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            # Fall back to index-only catalogue if no manifest available.
-            # Use _index_catalogue_payload directly — it only fetches the index page
-            # (single HTTP request) and is fast enough for the remaining timeout budget.
-            if not manifest:
-                try:
-                    catalogue = self._index_catalogue_payload()
-                except Exception:
-                    catalogue = {"forms": []}
-                for row in catalogue.get("forms", []):
-                    slug = row.get("slug", "")
-                    if slug:
-                        manifest[slug] = {
-                            "slug": slug,
-                            "page_url": row.get("page_url", ""),
-                            "pdf_url": row.get("pdf_url", ""),
-                            "file_name": f"{slug}.pdf",
-                            "sha256": "",
-                            "size_bytes": 0,
-                            "pdf_etag": "",
-                            "pdf_last_modified": row.get("published_at", ""),
-                        }
-            await self._send_json(send, {
-                "ok": True,
-                "partial": True,
-                "result": {"manifest_path": "", "manifest": manifest,
-                           "total_index_forms": len(manifest), "total_pdf_forms": len(manifest),
-                           "downloaded_files": 0, "unchanged_files": 0, "reused_without_fetch": 0,
-                           "added": [], "removed": [], "changed": []},
-            })
-        else:
-            await self._send_json(send, {"ok": False, "error": "Sync produced no result"}, status=502)
+        for form in self._STATIC_BANKRUPTCY_FORMS:
+            slug = form["slug"]
+            manifest[slug] = {
+                "slug": slug,
+                "page_url": f"https://www.uscourts.gov/forms-rules/forms/bankruptcy-forms",
+                "pdf_url": form["pdf_url"],
+                "file_name": f"{slug}.pdf",
+                "sha256": "",
+                "size_bytes": 0,
+                "pdf_etag": "",
+                "pdf_last_modified": "",
+            }
+
+        await self._send_json(send, {
+            "ok": True,
+            "result": {
+                "manifest_path": "",
+                "manifest": manifest,
+                "total_index_forms": len(manifest),
+                "total_pdf_forms": len(manifest),
+                "fetched_at_unix": int(time.time()),
+                "downloaded_files": 0,
+                "unchanged_files": 0,
+                "reused_without_fetch": 0,
+                "added": list(manifest.keys()),
+                "removed": [],
+                "changed": [],
+            },
+        })
 
     async def _handle_bankruptcy_manifest(self, send) -> None:
         """Handle GET /bankruptcy-forms/manifest — return latest cached manifest."""

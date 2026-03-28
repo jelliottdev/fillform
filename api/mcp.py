@@ -1196,6 +1196,7 @@ if(!document.getElementById('rows').children.length){ load(false); }
             )
 
         # Run with timeout to stay within Vercel's function limits.
+        # Hobby plan: 10s, Pro: 60s. Use 8s to leave room for response serialization.
         sync_result = None
         timed_out = False
         try:
@@ -1203,7 +1204,7 @@ if(!document.getElementById('rows').children.length){ load(false); }
                 future = pool.submit(_do_sync)
                 try:
                     from dataclasses import asdict
-                    sync_result = asdict(future.result(timeout=50.0))
+                    sync_result = asdict(future.result(timeout=8.0))
                 except concurrent.futures.TimeoutError:
                     timed_out = True
         except Exception as exc:
@@ -1234,8 +1235,13 @@ if(!document.getElementById('rows').children.length){ load(false); }
                 except Exception:
                     pass
             # Fall back to index-only catalogue if no manifest available.
+            # Use _index_catalogue_payload directly — it only fetches the index page
+            # (single HTTP request) and is fast enough for the remaining timeout budget.
             if not manifest:
-                catalogue = self._analytics_payload(refresh=False)
+                try:
+                    catalogue = self._index_catalogue_payload()
+                except Exception:
+                    catalogue = {"forms": []}
                 for row in catalogue.get("forms", []):
                     slug = row.get("slug", "")
                     if slug:

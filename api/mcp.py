@@ -1164,7 +1164,12 @@ if(!document.getElementById('rows').children.length){ load(false); }
         return body
 
     async def _handle_bankruptcy_sync(self, receive, send) -> None:
-        """Handle POST /bankruptcy-forms/sync — run crawler and return manifest inline."""
+        """Handle POST /bankruptcy-forms/sync — run crawler and return manifest inline.
+
+        On Vercel, the full crawl (60+ pages + sitemap) exceeds function timeout.
+        This uses a thread-pool timeout to return partial results if the crawl
+        doesn't finish in time, and falls back to the index-only catalogue.
+        """
         body = await self._read_body(receive)
         payload: dict[str, Any] = {}
         if body:
@@ -1176,42 +1181,84 @@ if(!document.getElementById('rows').children.length){ load(false); }
 
         out_dir = Path("/tmp/fillform_bankruptcy_forms")
         state_path = Path("/tmp/fillform_bankruptcy_state.json")
+        interval = float(payload.get("min_request_interval_seconds", 1.2))
+        max_pages = payload.get("max_form_pages")
+        if max_pages is not None:
+            max_pages = int(max_pages)
 
-        # Force download_pdfs=false on Vercel to stay within timeout limits.
-        # Callers download PDFs directly from uscourts.gov.
-        try:
-            sync_request = BankruptcySyncRequest(
+        def _do_sync():
+            syncer = USCourtsBankruptcyFormsSync(min_request_interval_seconds=interval)
+            return syncer.sync(
                 output_dir=out_dir,
                 state_path=state_path,
                 download_pdfs=False,
-                min_request_interval_seconds=float(payload.get("min_request_interval_seconds", 1.2)),
-                max_form_pages=None,
+                max_form_pages=max_pages,
             )
-        except (ValueError, TypeError) as exc:
-            await self._send_json(send, {"ok": False, "error": str(exc)}, status=400)
-            return
 
+        # Run with timeout to stay within Vercel's function limits.
+        sync_result = None
+        timed_out = False
         try:
-            tool = BankruptcyFormsTool()
-            result = tool.run(sync_request)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_do_sync)
+                try:
+                    from dataclasses import asdict
+                    sync_result = asdict(future.result(timeout=50.0))
+                except concurrent.futures.TimeoutError:
+                    timed_out = True
         except Exception as exc:
             await self._send_json(send, {"ok": False, "error": f"Sync failed: {exc}"}, status=502)
             return
 
-        # Load the manifest and include it directly in the response so callers
-        # don't need a separate /manifest fetch (ephemeral /tmp won't persist).
+        # Load the manifest — either from the completed sync or from cached state.
         manifest: dict[str, Any] = {}
-        manifest_path_str = result.get("manifest_path", "")
-        if manifest_path_str:
-            manifest_file = Path(manifest_path_str)
-            if manifest_file.exists():
+        if sync_result:
+            manifest_path_str = sync_result.get("manifest_path", "")
+            if manifest_path_str:
+                mp = Path(manifest_path_str)
+                if mp.exists():
+                    try:
+                        manifest = json.loads(mp.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+            sync_result["manifest"] = manifest
+            await self._send_json(send, {"ok": True, "result": sync_result})
+        elif timed_out:
+            # Sync didn't complete — try returning cached manifest from state file.
+            if state_path.exists():
                 try:
-                    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    latest = state.get("latest_manifest_path")
+                    if latest and Path(latest).exists():
+                        manifest = json.loads(Path(latest).read_text(encoding="utf-8"))
                 except Exception:
                     pass
-        result["manifest"] = manifest
-
-        await self._send_json(send, {"ok": True, "result": result})
+            # Fall back to index-only catalogue if no manifest available.
+            if not manifest:
+                catalogue = self._analytics_payload(refresh=False)
+                for row in catalogue.get("forms", []):
+                    slug = row.get("slug", "")
+                    if slug:
+                        manifest[slug] = {
+                            "slug": slug,
+                            "page_url": row.get("page_url", ""),
+                            "pdf_url": row.get("pdf_url", ""),
+                            "file_name": f"{slug}.pdf",
+                            "sha256": "",
+                            "size_bytes": 0,
+                            "pdf_etag": "",
+                            "pdf_last_modified": row.get("published_at", ""),
+                        }
+            await self._send_json(send, {
+                "ok": True,
+                "partial": True,
+                "result": {"manifest_path": "", "manifest": manifest,
+                           "total_index_forms": len(manifest), "total_pdf_forms": len(manifest),
+                           "downloaded_files": 0, "unchanged_files": 0, "reused_without_fetch": 0,
+                           "added": [], "removed": [], "changed": []},
+            })
+        else:
+            await self._send_json(send, {"ok": False, "error": "Sync produced no result"}, status=502)
 
     async def _handle_bankruptcy_manifest(self, send) -> None:
         """Handle GET /bankruptcy-forms/manifest — return latest cached manifest."""

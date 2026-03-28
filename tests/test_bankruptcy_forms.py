@@ -107,6 +107,19 @@ class BankruptcyFormsSyncTests(unittest.TestCase):
             ],
         )
 
+    def test_extract_page_metadata(self) -> None:
+        html = """
+        <div>Form Number: <strong>B 122A-2</strong></div>
+        <div>Category: <span>Means Test Forms</span></div>
+        <div>Updated on April 1, 2025</div>
+        <div>Effective on April 1, 2022</div>
+        """
+        meta = self.syncer._extract_page_metadata(html)
+        self.assertEqual(meta["form_number"], "B 122A-2")
+        self.assertEqual(meta["category"], "Means Test Forms")
+        self.assertEqual(meta["updated_on"], "April 1, 2025")
+        self.assertEqual(meta["effective_on"], "April 1, 2022")
+
     def test_parse_robots_crawl_delay(self) -> None:
         robots_txt = """
         User-agent: *

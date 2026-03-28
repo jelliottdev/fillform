@@ -66,6 +66,10 @@ class FormDocument:
     size_bytes: int
     pdf_etag: str
     pdf_last_modified: str
+    form_number: str
+    category: str
+    updated_on: str
+    effective_on: str
 
 
 @dataclass(slots=True)
@@ -158,6 +162,7 @@ class USCourtsBankruptcyFormsSync:
             pdf_urls = self._extract_pdf_links(page_url, page_html)
             if not pdf_urls:
                 continue
+            page_meta = self._extract_page_metadata(page_html)
 
             for idx, pdf_url in enumerate(pdf_urls, start=1):
                 doc_key = self._document_key(slug, pdf_url, idx)
@@ -196,6 +201,10 @@ class USCourtsBankruptcyFormsSync:
                         size_bytes=file_size,
                         pdf_etag=pdf_etag,
                         pdf_last_modified=pdf_last_modified,
+                        form_number=page_meta.get("form_number", ""),
+                        category=page_meta.get("category", ""),
+                        updated_on=page_meta.get("updated_on", ""),
+                        effective_on=page_meta.get("effective_on", ""),
                     )
                 )
 
@@ -310,6 +319,22 @@ class USCourtsBankruptcyFormsSync:
                 continue
             out.add(absolute)
         return sorted(out)
+
+    def _extract_page_metadata(self, html: str) -> dict[str, str]:
+        # Lightweight tag stripping to make regex extraction robust to markup changes.
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\\s+", " ", text).strip()
+
+        def _pull(pattern: str) -> str:
+            m = re.search(pattern, text, flags=re.I)
+            return (m.group(1).strip() if m else "")
+
+        return {
+            "form_number": _pull(r"Form Number:\s*([A-Za-z0-9\- ]{2,30})"),
+            "category": _pull(r"Category:\s*([A-Za-z0-9\- /]{2,60})"),
+            "updated_on": _pull(r"Updated on\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})"),
+            "effective_on": _pull(r"Effective on\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})"),
+        }
 
     def _discover_form_page_lastmods(
         self,

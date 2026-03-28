@@ -46,7 +46,6 @@ from mcp.types import ImageContent, TextContent, Tool
 
 from fillform.annotator import PdfAnnotator
 from fillform.bankruptcy_forms import BANKRUPTCY_INDEX_URL, USCourtsBankruptcyFormsSync
-from fillform.bankruptcy_tool import BankruptcyFormsTool, BankruptcySyncRequest
 from fillform.contracts import CanonicalField, CanonicalSchema
 from fillform.field_alias import FieldAliasRegistry
 from fillform.structure import PdfStructureService, PyMuPdfStructureAdapter, TextBlock
@@ -948,6 +947,9 @@ class _App:
                     "pdf_url": record.get("pdf_url"),
                     "page_url": record.get("page_url"),
                     "published_at": record.get("pdf_last_modified") or "",
+                    "updated_on": record.get("updated_on") or "",
+                    "effective_on": record.get("effective_on") or "",
+                    "form_number": record.get("form_number") or "",
                     "doc_type": self._doc_type_from_url(str(record.get("pdf_url") or "")),
                 }
             )
@@ -1001,6 +1003,9 @@ class _App:
                 "pdf_url": page_url,
                 "page_url": page_url,
                 "published_at": "",
+                "updated_on": "",
+                "effective_on": "",
+                "form_number": "",
                 "doc_type": self._doc_type_from_url(page_url),
             }
             for page_url in pages
@@ -1037,6 +1042,7 @@ class _App:
         chapter_counts = {"7": 0, "11": 0, "12": 0, "13": 0}
         schedule_count = 0
         published_count = 0
+        updated_on_count = 0
         doc_type_counts: dict[str, int] = {}
         for row in rows:
             slug = str(row.get("slug") or "").lower()
@@ -1047,12 +1053,15 @@ class _App:
                 chapter_counts[m.group(1)] += 1
             if row.get("published_at"):
                 published_count += 1
+            if row.get("updated_on"):
+                updated_on_count += 1
             dtype = str(row.get("doc_type") or "unknown")
             doc_type_counts[dtype] = doc_type_counts.get(dtype, 0) + 1
 
         return {
             "schedule_records": schedule_count,
             "published_header_records": published_count,
+            "updated_on_records": updated_on_count,
             "chapter_counts": chapter_counts,
             "doc_type_counts": doc_type_counts,
             "unique_page_count": len({str(r.get("page_url") or "") for r in rows}),
@@ -1067,10 +1076,12 @@ class _App:
             if not isinstance(row, dict):
                 continue
             slug = html.escape(str(row.get("slug", "")))
+            form_number = html.escape(str(row.get("form_number", "")))
+            updated_on = html.escape(str(row.get("updated_on", "")))
             published = html.escape(str(row.get("published_at", "")))
             pdf_url = html.escape(str(row.get("pdf_url", "")))
             rows_html.append(
-                f"<tr><td>{slug}</td><td>{published}</td><td><a href='{pdf_url}' target='_blank'>open</a></td></tr>"
+                f"<tr><td>{slug}</td><td>{form_number}</td><td>{updated_on}</td><td>{published}</td><td><a href='{pdf_url}' target='_blank'>open</a></td></tr>"
             )
         rows_markup = "".join(rows_html)
 
@@ -1109,7 +1120,7 @@ th{background:#fafafa;text-align:left}
 <button onclick='load(true)'>Refresh analytics</button>
 <pre id='summary'>__SUMMARY__</pre>
 <pre id='details'>__DETAILS__</pre>
-<table><thead><tr><th>Form Key</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'>__ROWS__</tbody></table>
+<table><thead><tr><th>Form Key</th><th>Form #</th><th>Updated on</th><th>Published (header)</th><th>PDF</th></tr></thead><tbody id='rows'>__ROWS__</tbody></table>
 <script>
 async function load(force){
   try{
@@ -1123,7 +1134,7 @@ async function load(force){
     const rows=document.getElementById('rows'); rows.innerHTML='';
     data.forms.forEach(f=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td>${f.slug}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
+      tr.innerHTML=`<td>${f.slug}</td><td>${f.form_number||''}</td><td>${f.updated_on||''}</td><td>${f.published_at||''}</td><td><a href='${f.pdf_url}' target='_blank'>open</a></td>`;
       rows.appendChild(tr);
     });
   }catch(err){
@@ -1141,88 +1152,6 @@ if(!document.getElementById('rows').children.length){ load(false); }
             .replace("__ROWS__", rows_markup)
         )
 
-    async def _read_body(self, receive) -> bytes:
-        """Read full request body from ASGI receive channel."""
-        body = b""
-        while True:
-            message = await receive()
-            body += message.get("body", b"")
-            if not message.get("more_body", False):
-                break
-        return body
-
-    async def _handle_bankruptcy_sync(self, receive, send) -> None:
-        """Handle POST /bankruptcy-forms/sync — run crawler and return manifest inline."""
-        body = await self._read_body(receive)
-        payload: dict[str, Any] = {}
-        if body:
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                await self._send_json(send, {"ok": False, "error": "Invalid JSON body"}, status=400)
-                return
-
-        out_dir = Path("/tmp/fillform_bankruptcy_forms")
-        state_path = Path("/tmp/fillform_bankruptcy_state.json")
-
-        # Force download_pdfs=false on Vercel to stay within timeout limits.
-        # Callers download PDFs directly from uscourts.gov.
-        try:
-            sync_request = BankruptcySyncRequest(
-                output_dir=out_dir,
-                state_path=state_path,
-                download_pdfs=False,
-                min_request_interval_seconds=float(payload.get("min_request_interval_seconds", 1.2)),
-                max_form_pages=None,
-            )
-        except (ValueError, TypeError) as exc:
-            await self._send_json(send, {"ok": False, "error": str(exc)}, status=400)
-            return
-
-        try:
-            tool = BankruptcyFormsTool()
-            result = tool.run(sync_request)
-        except Exception as exc:
-            await self._send_json(send, {"ok": False, "error": f"Sync failed: {exc}"}, status=502)
-            return
-
-        # Load the manifest and include it directly in the response so callers
-        # don't need a separate /manifest fetch (ephemeral /tmp won't persist).
-        manifest: dict[str, Any] = {}
-        manifest_path_str = result.get("manifest_path", "")
-        if manifest_path_str:
-            manifest_file = Path(manifest_path_str)
-            if manifest_file.exists():
-                try:
-                    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-        result["manifest"] = manifest
-
-        await self._send_json(send, {"ok": True, "result": result})
-
-    async def _handle_bankruptcy_manifest(self, send) -> None:
-        """Handle GET /bankruptcy-forms/manifest — return latest cached manifest."""
-        state_path = Path("/tmp/fillform_bankruptcy_state.json")
-        if not state_path.exists():
-            await self._send_json(send, {"ok": False, "error": "No manifest available. Run sync first."}, status=404)
-            return
-
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            manifest_path = state.get("latest_manifest_path")
-            if not manifest_path:
-                await self._send_json(send, {"ok": False, "error": "No manifest path in state."}, status=404)
-                return
-            manifest_file = Path(manifest_path)
-            if not manifest_file.exists():
-                await self._send_json(send, {"ok": False, "error": "Manifest file not found."}, status=404)
-                return
-            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-            await self._send_json(send, manifest)
-        except Exception as exc:
-            await self._send_json(send, {"ok": False, "error": str(exc)}, status=500)
-
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
             await receive()
@@ -1231,20 +1160,7 @@ if(!document.getElementById('rows').children.length){ load(false); }
             await send({"type": "lifespan.shutdown.complete"})
             return
         path = scope.get("path", "/")
-        method = scope.get("method", "")
-
-        # Bankruptcy form sync routes
-        if path == "/bankruptcy-forms/sync" and method == "POST":
-            await self._handle_bankruptcy_sync(receive, send)
-            return
-        if path == "/bankruptcy-forms/manifest" and method == "GET":
-            await self._handle_bankruptcy_manifest(send)
-            return
-        if path == "/health" and method == "GET":
-            await self._send_json(send, {"ok": True, "service": "fillform-bankruptcy-mcp"})
-            return
-
-        if method == "GET":
+        if scope.get("method") == "GET":
             if path in ("/", "/index.html"):
                 await self._send_html(send, self._home_html(self._base_url(scope), None), status=200)
                 return
